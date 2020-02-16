@@ -1,6 +1,103 @@
 # Change Log
 
-## [Unreleased](https://github.com/trailofbits/manticore/compare/0.3.0...HEAD)
+## [Unreleased](https://github.com/trailofbits/manticore/compare/0.3.3...HEAD)
+
+## 0.3.3 - 2020-01
+
+Thanks to our external contributors!
+
+ - [catenacyber](https://github.com/trailofbits/manticore/commits?author=catenacyber)
+
+### Ethereum
+* **[added API]** Flag to only generate alive states when finalizing Manticore [#1554](https://github.com/trailofbits/manticore/pull/1554)
+* Fix gas check [#1587](https://github.com/trailofbits/manticore/pull/1587)
+
+### Native
+* **[added API]** Add post-instruction hooks [#1579](https://github.com/trailofbits/manticore/pull/1579)
+* Fix issue with re-using stdio file descriptors after they'd been closed [#1604](https://github.com/trailofbits/manticore/pull/1604)
+
+### WASM
+* **[added API]** getattr-style calls for WASM functions [#1578](https://github.com/trailofbits/manticore/pull/1578)
+* **[changed API]** Pass state to function calls instead of constraint sets [#1578](https://github.com/trailofbits/manticore/pull/1578)
+* **[added API]** Added read/write helper methods to memory instances [#1589](https://github.com/trailofbits/manticore/pull/1589)
+
+### Other
+* **[added API]** Added streamlined state serialization interface [#1596](https://github.com/trailofbits/manticore/pull/1596)
+* Fixed Z3 version parsing [#1551](https://github.com/trailofbits/manticore/pull/1551)
+* Unique names for ArrayVars [#1552](https://github.com/trailofbits/manticore/pull/1552)
+* Improve pickling and multiprocessing compatibility [#1583](https://github.com/trailofbits/manticore/pull/1583)
+* Fix SMTLib visitor bug that broke the example tests [#1577](https://github.com/trailofbits/manticore/pull/1577)
+* Optimize MinMax SMTLib operations [#1599](https://github.com/trailofbits/manticore/pull/1599)
+
+## 0.3.2 - 2019-11-11
+
+Thanks to our external contributors!
+
+ - [Srinivas11789](https://github.com/trailofbits/manticore/commits?author=Srinivas11789)
+ - [catenacyber](https://github.com/trailofbits/manticore/commits?author=catenacyber)
+ - [Boyan-MILANOV](https://github.com/trailofbits/manticore/commits?author=Boyan-MILANOV)
+
+### Ethereum
+* **[added API]** Use higher-level test generation to symbolically execute SHA3 [#1526](https://github.com/trailofbits/manticore/pull/1526)
+* **[added API]** Added fast unsound SHA3 strategy [#1549](https://github.com/trailofbits/manticore/pull/1549)
+* **[added API]** Added plugin for discarding states without changes to storage [#1507](https://github.com/trailofbits/manticore/pull/1507)
+* **[fixed API]** Fix `ADDMOD` and `MULMOD` [#1531](https://github.com/trailofbits/manticore/pull/1531)
+* Warn on missing bytecode [#1534](https://github.com/trailofbits/manticore/pull/1534)
+* Simplifiy PC upon modification [#1523](https://github.com/trailofbits/manticore/pull/1523)
+
+
+### Native
+* Better memory tests ([#1506](https://github.com/trailofbits/manticore/pull/1506), [1524](https://github.com/trailofbits/manticore/pull/1524))
+* Memory IO performance improvements [#1509](https://github.com/trailofbits/manticore/pull/1509)
+* **[added API]**  Expose ELF dynamic load addresses [#1515](https://github.com/trailofbits/manticore/pull/1515)
+* Optimize instruction decoding ([#1522](https://github.com/trailofbits/manticore/pull/1522), [#1527](https://github.com/trailofbits/manticore/pull/1527))
+* Add partial support for `recvfrom` syscall [#1514](https://github.com/trailofbits/manticore/pull/1514)
+* **[fixed API]** Add `will_write_memory` event to `write_bytes` [#1535](https://github.com/trailofbits/manticore/pull/1535)
+* Update supported Unicorn version [#1536](https://github.com/trailofbits/manticore/pull/1536)
+* Fix file pointer leak in ELF interpreter [#1538](https://github.com/trailofbits/manticore/pull/1538)
+* Deduplicate socket symbol names [#1542](https://github.com/trailofbits/manticore/pull/1542)
+* Improve environment variable parsing [#1545](https://github.com/trailofbits/manticore/pull/1545)
+* **[fixed API]** Reduce chance of orphaned `did_execute_instruction` event [#1529](https://github.com/trailofbits/manticore/pull/1529)
+
+### WASM
+* **[added API]** Added initial support for webassembly [#1495](https://github.com/trailofbits/manticore/pull/1495)
+
+### Other
+* Incorporate type checking (mypy) into CI [#1544](https://github.com/trailofbits/manticore/pull/1544)
+* Fixes to smtlib ([#1512](https://github.com/trailofbits/manticore/pull/1512), [#1511](https://github.com/trailofbits/manticore/pull/1511))
+* Remove runtime type checking from smtlib to improve performance [#1543](https://github.com/trailofbits/manticore/pull/1543)
+* Logging improvements ([#1518](https://github.com/trailofbits/manticore/pull/1518), [#1520](https://github.com/trailofbits/manticore/pull/1520))
+* Simplify unsigned division constant folding [#1530](https://github.com/trailofbits/manticore/pull/1530)
+* Improve signed division logic [#1540](https://github.com/trailofbits/manticore/pull/1540)
+* **[changed API]** Move to manticore-specific exception types [#1537](https://github.com/trailofbits/manticore/pull/1537)
+* **[changed API]** Save profiling data in the workspace instead of the current directory [#1539](https://github.com/trailofbits/manticore/pull/1539)
+
+
+## 0.3.1 - 2019-08-06
+
+Thanks to our external contributors!
+
+ - [arcz](https://github.com/trailofbits/manticore/commits?author=arcz)
+
+### Ethereum
+* Smart contracts are now compiled using [Crytic-Compile](https://github.com/crytic/crytic-compile) [#1406](https://github.com/trailofbits/manticore/pull/1406)
+* Added detector for strict comparisons to BALANCE [#1481](https://github.com/trailofbits/manticore/pull/1481)
+* Added bitshift instructions [#1498](https://github.com/trailofbits/manticore/pull/1498)
+* Added stub for STATICCALL (does not enforce static nature) [#1494](https://github.com/trailofbits/manticore/pull/1494)
+* Updated EVM Examples [#1486](https://github.com/trailofbits/manticore/pull/1486)
+
+### Native
+* Fixed `getdents` syscall [#1472](https://github.com/trailofbits/manticore/pull/1472)
+* Fixed state merging examples [#1482](https://github.com/trailofbits/manticore/pull/1482)
+* Support LSR.W on ARMV7 [#1363](https://github.com/trailofbits/manticore/pull/1363)
+* Fixed CrackMe Example [#1502](https://github.com/trailofbits/manticore/pull/1502)
+* Optimize CMPXCHG8B [#1501](https://github.com/trailofbits/manticore/pull/1501)
+* Added `fast_crash` configuration setting that causes Manticore to immediately produce a finding on memory unsafety [#1485](https://github.com/trailofbits/manticore/pull/1485)
+
+### Other
+* **[changed API]** Moved `issymbolic` into SMTLib to improve performance [#1456](https://github.com/trailofbits/manticore/pull/1456)
+* Refactored API Docs [#1469](https://github.com/trailofbits/manticore/pull/1469)
+* Fixed `FileNotFound` Error on state loading [#1480](https://github.com/trailofbits/manticore/pull/1480)
 
 ## 0.3.0 - 2019-06-06
 

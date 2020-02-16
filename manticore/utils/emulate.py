@@ -10,8 +10,7 @@ from unicorn import *
 from unicorn.arm_const import *
 from unicorn.x86_const import *
 
-from .helpers import issymbolic
-from ..core.smtlib import Operators, solver
+from ..core.smtlib import Operators, Z3Solver, issymbolic
 from ..native.memory import MemoryException
 
 logger = logging.getLogger(__name__)
@@ -100,7 +99,7 @@ class ConcreteUnicornEmulator:
         self.registers = set(self._cpu.canonical_registers)
         # The last 8 canonical registers of x86 are individual flags; replace with the eflags
         self.registers -= self.flag_registers
-        # TODO(eric_k): unicorn@778171fc9546c1fc3d1341ff1151eab379848ea0 doesn't like writing to
+        # TODO(eric_k): unicorn@1.0.2rc1 doesn't like writing to
         # the FS register, and it will segfault or hang.
         self.registers -= {"FS"}
         self.registers.add("EFLAGS")
@@ -252,7 +251,7 @@ class ConcreteUnicornEmulator:
             return globals()["UC_ARM_REG_" + reg_name]
         elif self._cpu.arch == CS_ARCH_X86:
             # TODO(yan): This needs to handle AF register
-            custom_mapping = {"PC": "RIP", "STACK": "RSP"}
+            custom_mapping = {"PC": "RIP", "STACK": "RSP", "FRAME": "RBP"}
             try:
                 return globals()["UC_X86_REG_" + custom_mapping.get(reg_name, reg_name)]
             except KeyError:
@@ -352,7 +351,7 @@ class ConcreteUnicornEmulator:
                 concrete_data = []
                 for c in data:
                     if issymbolic(c):
-                        c = chr(solver.get_value(self._cpu.memory.constraints, c))
+                        c = chr(Z3Solver.instance().get_value(self._cpu.memory.constraints, c))
                     concrete_data.append(c)
                 data = concrete_data
             else:
@@ -376,7 +375,7 @@ class ConcreteUnicornEmulator:
         if reg in self.flag_registers:
             self._emu.reg_write(self._to_unicorn_id("EFLAGS"), self._cpu.read_register("EFLAGS"))
             return
-        # TODO(eric_k): unicorn@778171fc9546c1fc3d1341ff1151eab379848ea0 doesn't like writing to
+        # TODO(eric_k): unicorn@1.0.2rc1 doesn't like writing to
         # the FS register, and it will segfault or hang.
         if reg in {"FS"}:
             logger.warning(f"Skipping {reg} write. Unicorn unsupported register write.")

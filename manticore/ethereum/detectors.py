@@ -1,17 +1,26 @@
 from manticore.core.smtlib.visitors import simplify
 import hashlib
+from enum import Enum
+from typing import Optional
 import logging
 from contextlib import contextmanager
 
-from ..core.smtlib import Operators, Constant, simplify
-from ..utils.helpers import istainted, issymbolic, taint_with, get_taints
+from ..core.smtlib import (
+    Operators,
+    Constant,
+    simplify,
+    istainted,
+    issymbolic,
+    get_taints,
+    taint_with,
+)
 from ..core.plugin import Plugin
 
 
 logger = logging.getLogger(__name__)
 
 
-class DetectorClassification:
+class DetectorClassification(Enum):
     """
     Shall be consistent with
     https://github.com/trailofbits/slither/blob/563d5118298e4cae7f0ea5f2a531f0dcdcebd64d/slither/detectors/abstract_detector.py#L11-L15
@@ -24,10 +33,14 @@ class DetectorClassification:
 
 
 class Detector(Plugin):
-    ARGUMENT = None  # argument that needs to be passed to --detect to use given detector
-    HELP = None  # help string
-    IMPACT = None  # DetectorClassification value
-    CONFIDENCE = None  # DetectorClassification value
+    # argument that needs to be passed to --detect to use given detector
+    ARGUMENT: Optional[str] = None
+    # help string
+    HELP: Optional[str] = None
+    # DetectorClassification value
+    IMPACT: Optional[DetectorClassification] = None
+    # DetectorClassification value
+    CONFIDENCE: Optional[DetectorClassification] = None
 
     @property
     def name(self):
@@ -488,12 +501,12 @@ class DetectIntegerOverflow(Detector):
             for taint in get_taints(what, "IOS_.*"):
                 address, pc, finding, at_init, condition = self._get_location(state, taint[4:])
                 if state.can_be_true(condition):
-                    self.add_finding(state, address, pc, finding, at_init)
+                    self.add_finding(state, address, pc, finding, at_init, condition)
         else:
             for taint in get_taints(what, "IOU_.*"):
                 address, pc, finding, at_init, condition = self._get_location(state, taint[4:])
                 if state.can_be_true(condition):
-                    self.add_finding(state, address, pc, finding, at_init)
+                    self.add_finding(state, address, pc, finding, at_init, condition)
 
     def did_evm_execute_instruction_callback(self, state, instruction, arguments, result):
         vm = state.platform.current_vm
@@ -648,13 +661,14 @@ class DetectUninitializedMemory(Detector):
     IMPACT = DetectorClassification.MEDIUM
     CONFIDENCE = DetectorClassification.HIGH
 
-    def did_evm_read_memory_callback(self, state, offset, value):
+    def did_evm_read_memory_callback(self, state, offset, value, size):
         initialized_memory = state.context.get("{:s}.initialized_memory".format(self.name), set())
         cbu = True  # Can be unknown
         current_contract = state.platform.current_vm.address
         for known_contract, known_offset in initialized_memory:
             if current_contract == known_contract:
-                cbu = Operators.AND(cbu, offset != known_offset)
+                for offset_i in range(offset, offset + size):
+                    cbu = Operators.AND(cbu, offset_i != known_offset)
         if state.can_be_true(cbu):
             self.add_finding_here(
                 state,
@@ -662,13 +676,14 @@ class DetectUninitializedMemory(Detector):
                 % (current_contract, offset),
             )
 
-    def did_evm_write_memory_callback(self, state, offset, value):
+    def did_evm_write_memory_callback(self, state, offset, value, size):
         current_contract = state.platform.current_vm.address
 
         # concrete or symbolic write
-        state.context.setdefault("{:s}.initialized_memory".format(self.name), set()).add(
-            (current_contract, offset)
-        )
+        for offset_i in range(offset, offset + size):
+            state.context.setdefault("{:s}.initialized_memory".format(self.name), set()).add(
+                (current_contract, offset)
+            )
 
 
 class DetectUninitializedStorage(Detector):
@@ -692,7 +707,7 @@ class DetectUninitializedStorage(Detector):
             cbu = Operators.AND(cbu, Operators.OR(address != known_address, offset != known_offset))
 
         if state.can_be_true(cbu):
-            self.add_finding_here(state, "Potentially reading uninitialized storage")
+            self.add_finding_here(state, "Potentially reading uninitialized storage", cbu)
 
     def did_evm_write_storage_callback(self, state, address, offset, value):
         # concrete or symbolic write
@@ -831,3 +846,28 @@ class DetectRaceCondition(Detector):
 
                             self.__findings.add(unique_key)
                             self.add_finding_here(state, msg)
+
+
+class DetectManipulableBalance(Detector):
+    """
+    Detects the use of manipulable balance in strict compare.
+    """
+
+    ARGUMENT = "lockdrop"
+    HELP = "Use balance in EQ"
+    IMPACT = DetectorClassification.HIGH
+    CONFIDENCE = DetectorClassification.HIGH
+
+    def did_evm_execute_instruction_callback(self, state, instruction, arguments, result):
+        vm = state.platform.current_vm
+        mnemonic = instruction.semantics
+
+        if mnemonic == "BALANCE":
+            # replace result with tainted value
+            result = taint_with(result, "BALANCE")
+            vm.change_last_result(result)
+        elif mnemonic == "EQ":
+            # check if balance tainted
+            for op in arguments:
+                if istainted(op, "BALANCE"):
+                    self.add_finding_here(state, "Manipulable balance used in a strict comparison")

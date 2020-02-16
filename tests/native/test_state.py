@@ -5,6 +5,11 @@ from manticore.utils.event import Eventful
 from manticore.platforms import linux
 from manticore.native.state import State
 from manticore.core.smtlib import BitVecVariable, ConstraintSet
+from manticore.native import Manticore
+from manticore.native.plugins import Merger
+from manticore.core.plugin import Plugin
+from manticore.utils import config
+from manticore.utils.helpers import pickle_dumps
 
 
 class FakeMemory:
@@ -80,7 +85,7 @@ class StateTest(unittest.TestCase):
         expr = BitVecVariable(32, "tmp")
         self.state.constrain(expr > 4)
         self.state.constrain(expr < 7)
-        solved = self.state.solve_n(expr, 2)
+        solved = sorted(self.state.solve_n(expr, 2))
         self.assertEqual(solved, [5, 6])
 
     def test_solve_n2(self):
@@ -161,7 +166,7 @@ class StateTest(unittest.TestCase):
         constraints = ConstraintSet()
         initial_state = State(constraints, FakePlatform())
         initial_state.context["step"] = 10
-        initial_file = pickle.dumps(initial_state)
+        initial_file = pickle_dumps(initial_state)
         with initial_state as new_state:
             self.assertEqual(initial_state.context["step"], 10)
             self.assertEqual(new_state.context["step"], 10)
@@ -170,7 +175,7 @@ class StateTest(unittest.TestCase):
 
             self.assertEqual(initial_state.context["step"], 10)
             self.assertEqual(new_state.context["step"], 20)
-            new_file = pickle.dumps(new_state)
+            new_file = pickle_dumps(new_state)
 
             with new_state as new_new_state:
                 self.assertEqual(initial_state.context["step"], 10)
@@ -183,7 +188,7 @@ class StateTest(unittest.TestCase):
                 self.assertEqual(new_state.context["step"], 20)
                 self.assertEqual(new_new_state.context["step"], 30)
 
-                new_new_file = pickle.dumps(new_new_state)
+                new_new_file = pickle_dumps(new_new_state)
 
                 self.assertEqual(initial_state.context["step"], 10)
                 self.assertEqual(new_state.context["step"], 20)
@@ -205,55 +210,61 @@ class StateTest(unittest.TestCase):
         new_new_state = pickle.loads(new_new_file)
         self.assertEqual(new_new_state.context["step"], 30)
 
-    def testContextSerialization(self):
-        import pickle as pickle
 
-        initial_file = ""
-        new_file = ""
-        new_new_file = ""
-        constraints = ConstraintSet()
-        initial_state = State(constraints, FakePlatform())
-        initial_state.context["step"] = 10
-        initial_file = pickle.dumps(initial_state)
-        with initial_state as new_state:
-            self.assertEqual(initial_state.context["step"], 10)
-            self.assertEqual(new_state.context["step"], 10)
+class StateMergeTest(unittest.TestCase):
 
-            new_state.context["step"] = 20
+    # Need to add a plugin that counts the number of states in did_fork_state, and records the max
+    # Then, when we hit
 
-            self.assertEqual(initial_state.context["step"], 10)
-            self.assertEqual(new_state.context["step"], 20)
-            new_file = pickle.dumps(new_state)
+    class StateCounter(Plugin):
+        def did_fork_state_callback(self, *_args, **_kwargs):
+            self.max_states = max(
+                self.max_states,
+                self.manticore.count_busy_states()
+                + self.manticore.count_ready_states()
+                + self.manticore.count_killed_states()
+                + self.manticore.count_terminated_states(),
+            )
 
-            with new_state as new_new_state:
-                self.assertEqual(initial_state.context["step"], 10)
-                self.assertEqual(new_state.context["step"], 20)
-                self.assertEqual(new_new_state.context["step"], 20)
+        @property
+        def max_states(self):
+            with self.manticore.locked_context() as ctx:
+                return ctx.setdefault("max_states", 0)
 
-                new_new_state.context["step"] += 10
+        @max_states.setter
+        def max_states(self, new_val):
+            with self.manticore.locked_context() as ctx:
+                ctx["max_states"] = new_val
 
-                self.assertEqual(initial_state.context["step"], 10)
-                self.assertEqual(new_state.context["step"], 20)
-                self.assertEqual(new_new_state.context["step"], 30)
+    def setUp(self):
+        core = config.get_group("core")
+        core.seed = 61
+        core.mprocessing = core.mprocessing.single
 
-                new_new_file = pickle.dumps(new_new_state)
+        dirname = os.path.dirname(__file__)
+        self.m = Manticore(
+            os.path.join(dirname, "binaries", "basic_state_merging"), policy="random"
+        )
+        self.plugin = self.StateCounter()
 
-                self.assertEqual(initial_state.context["step"], 10)
-                self.assertEqual(new_state.context["step"], 20)
-                self.assertEqual(new_new_state.context["step"], 30)
+        self.m.register_plugin(Merger())
+        self.m.register_plugin(self.plugin)
 
-            self.assertEqual(initial_state.context["step"], 10)
-            self.assertEqual(new_state.context["step"], 20)
+    def test_state_merging(self):
+        @self.m.hook(0x40065D)
+        def hook_post_merge(*_args, **_kwargs):
+            with self.m.locked_context() as ctx:
+                ctx["state_count"] = (
+                    self.m.count_busy_states()
+                    + self.m.count_ready_states()
+                    + self.m.count_killed_states()
+                    + self.m.count_terminated_states()
+                )
 
-        self.assertEqual(initial_state.context["step"], 10)
-
-        del initial_state
-        del new_state
-        del new_new_state
-
-        initial_state = pickle.loads(initial_file)
-        self.assertEqual(initial_state.context["step"], 10)
-        new_state = pickle.loads(new_file)
-        self.assertEqual(new_state.context["step"], 20)
-        new_new_state = pickle.loads(new_new_file)
-        self.assertEqual(new_new_state.context["step"], 30)
+        self.m.run()
+        s = config.get_group("core").seed
+        self.assertLess(
+            self.m.context["state_count"],
+            self.plugin.max_states,
+            f"State merging failed with seed: {s}",
+        )

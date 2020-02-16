@@ -11,18 +11,23 @@ from manticore.platforms.evm import EVMWorld
 
 from manticore.core.smtlib import operators, ConstraintSet
 from manticore.ethereum import (
-    ManticoreEVM,
-    DetectIntegerOverflow,
-    DetectUnusedRetVal,
-    DetectSuicidal,
     DetectDelegatecall,
-    DetectExternalCallAndLeak,
     DetectEnvInstruction,
+    DetectExternalCallAndLeak,
+    DetectIntegerOverflow,
+    DetectManipulableBalance,
+    Detector,
     DetectRaceCondition,
+    DetectSuicidal,
+    DetectUnusedRetVal,
+    ManticoreEVM,
     State,
 )
-from manticore.ethereum.plugins import LoopDepthLimiter
-from manticore.utils import config
+from manticore.ethereum.plugins import LoopDepthLimiter, KeepOnlyIfStorageChanges
+
+from manticore.utils import config, log
+
+from typing import Type
 
 consts = config.get_group("core")
 consts.mprocessing = consts.mprocessing.single
@@ -37,15 +42,13 @@ def make_mock_evm_state():
 
 
 class EthDetectorTest(unittest.TestCase):
-    """
-    Subclasses must assign this class variable to the class for the detector
-    """
-
-    DETECTOR_CLASS = None
+    # Subclasses must assign this class variable to the class for the detector
+    DETECTOR_CLASS: Type[Detector]
 
     def setUp(self):
         self.mevm = ManticoreEVM()
-        self.mevm.verbosity(0)
+        self.mevm.register_plugin(KeepOnlyIfStorageChanges())
+        log.set_verbosity(0)
         self.worksp = self.mevm.workspace
 
     def tearDown(self):
@@ -67,11 +70,15 @@ class EthDetectorTest(unittest.TestCase):
             ctor_arg = ()
 
         self.mevm.register_detector(self.DETECTOR_CLASS())
+
         with self.mevm.kill_timeout(240):
             mevm.multi_tx_analysis(
-                filepath, contract_name="DetectThis", args=ctor_arg, working_dir=dir
+                filepath,
+                contract_name="DetectThis",
+                args=ctor_arg,
+                compile_args={"solc_working_dir": dir},
             )
-
+        mevm.finalize()
         expected_findings = set(((finding, at_init) for finding, at_init in should_find))
         actual_findings = set(
             ((finding, at_init) for _addr, _pc, finding, at_init in mevm.global_findings)
@@ -388,6 +395,20 @@ class EthRaceCondition(EthDetectorTest):
                 ),
             },
         )
+
+
+class EthBalance(EthDetectorTest):
+    """ Test the detection of funny delegatecalls """
+
+    DETECTOR_CLASS = DetectManipulableBalance
+
+    def test_balance_ok(self):
+        name = inspect.currentframe().f_code.co_name[5:]
+        self._test(name, set())
+
+    def test_balance_not_ok(self):
+        name = inspect.currentframe().f_code.co_name[5:]
+        self._test(name, {(("Manipulable balance used in a strict comparison", False))})
 
 
 if __name__ == "__main__":

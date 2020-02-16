@@ -9,14 +9,24 @@ from ..core.smtlib import (
     BitVec,
     BitVecConstant,
     expression,
+    issymbolic,
 )
 from ..native.mappings import mmap, munmap
-from ..utils.helpers import issymbolic, interval_intersection
+from ..utils.helpers import interval_intersection
+from ..utils import config
 
 import functools
 import logging
 
 logger = logging.getLogger(__name__)
+
+consts = config.get_group("native")
+consts.add(
+    "fast_crash",
+    default=False,
+    description="If True, throws a memory safety error if ANY concretization of a pointer is"
+    " out of bounds. Otherwise, forks into valid and invalid memory access states.",
+)
 
 
 class MemoryException(Exception):
@@ -882,6 +892,28 @@ class Memory(object, metaclass=ABCMeta):
         else:
             return self.map_containing(index).perms
 
+    def max_exec_size(self, addr, max_size):
+        """
+        Finds maximum executable memory size
+        starting from addr and up to max_size.
+
+        :param addr: the starting address.
+        :param size: the maximum size.
+        :param access: the wished access.
+        """
+        size = 0
+        max_addr = addr + max_size
+        while addr < max_addr:
+            if addr not in self:
+                return size
+            m = self.map_containing(addr)
+            # could it be ? if access in m.perm
+            if not m.access_ok("x"):
+                return size
+            size += m.end - addr
+            addr = m.end
+        return max_size
+
     def access_ok(self, index, access, force=False):
         if isinstance(index, slice):
             assert index.stop - index.start >= 0
@@ -1015,8 +1047,14 @@ class SMemory(Memory):
         """
         Builds a memory.
 
-        :param constraints:  a set of constraints
-        :param symbols: Symbolic chunks
+        :param constraints:  a set of initial constraints
+        :param symbols: Symbolic chunks in format: {chunk_start_addr: (condition, value), ...}
+
+        `symbols` or `self._symbols` is a mapping of symbolic chunks/memory cells starting addresses
+        to their condition and value.
+
+        The condition of a symbolic chunk can be concrete (True/False) or symbolic. The value should
+        always be symbolic (e.g. a BitVecVariable).
         """
         super().__init__(*args, **kwargs)
         assert isinstance(constraints, ConstraintSet)
@@ -1027,7 +1065,7 @@ class SMemory(Memory):
             self._symbols = dict(symbols)
 
     def __reduce__(self):
-        return self.__class__, (self.constraints, self._symbols, self._maps), {"cpu": self.cpu}
+        return (self.__class__, (self.constraints, self._symbols, self._maps), {"cpu": self.cpu})
 
     @property
     def constraints(self):
@@ -1103,7 +1141,7 @@ class SMemory(Memory):
                 condition = False
                 for base in e.solutions:
                     condition = Operators.OR(address == base, condition)
-                from .state import ForkState
+                from ..core.state import ForkState
 
                 raise ForkState("Forking state on incomplete result", condition)
 
@@ -1145,11 +1183,13 @@ class SMemory(Memory):
     def write(self, address, value, force=False):
         """
         Write a value at address.
+
         :param address: The address at which to write
         :type address: int or long or Expression
         :param value: Bytes to write
         :type value: str or list
         :param force: Whether to ignore permissions
+
         """
         size = len(value)
         if issymbolic(address):
@@ -1162,16 +1202,41 @@ class SMemory(Memory):
                     self._symbols.setdefault(base + offset, []).append((condition, value[offset]))
         else:
 
+            # Symbolic writes are stored in self._symbols and concrete writes are offloaded to super().write(...)
+            #
+            # Symbolic values are written one by one and concrete are written in chunks
+            # To do this, the logic below tracks start index of the part where concrete values are
+            # and commits/triggers writes of those concrete values when a symbolic value is hit or after the loop
+            #
+            concrete_start = None
+
             for offset in range(size):
+                ea = address + offset
+
                 if issymbolic(value[offset]):
-                    if not self.access_ok(address + offset, "w", force):
-                        raise InvalidMemoryAccess(address + offset, "w")
-                    self._symbols[address + offset] = [(True, value[offset])]
+                    # Commit (offload) concrete write
+                    if concrete_start is not None:
+                        super().write(address + concrete_start, value[concrete_start:offset], force)
+                        concrete_start = None
+
+                    # Commit symbolic write if access is okay
+                    if not self.access_ok(ea, "w", force):
+                        raise InvalidMemoryAccess(ea, "w")
+                    self._symbols[ea] = [(True, value[offset])]
+
                 else:
-                    # overwrite all previous items
-                    if address + offset in self._symbols:
-                        del self._symbols[address + offset]
-                    super().write(address + offset, [value[offset]], force)
+                    # For concrete value, remove symbolic chunks that were stored there
+                    # (Note: there might be many because of conditions later leading to different program paths)
+                    if ea in self._symbols:
+                        del self._symbols[ea]
+
+                    # Set concrete part start index if previous values weren't concrete
+                    if concrete_start is None:
+                        concrete_start = offset
+
+            # Commit (offload) the last concrete write
+            if concrete_start is not None:
+                super().write(address + concrete_start, value[concrete_start:], force)
 
     def _try_get_solutions(self, address, size, access, max_solutions=0x1000, force=False):
         """
@@ -1193,7 +1258,19 @@ class SMemory(Memory):
             if not self.access_ok(slice(base, base + size), access, force):
                 crashing_condition = Operators.OR(address == base, crashing_condition)
 
-        if solver.can_be_true(self.constraints, crashing_condition):
+        crash_or_not = solver.get_all_values(self.constraints, crashing_condition, maxcnt=3)
+
+        if not consts.fast_crash and len(crash_or_not) == 2:
+            from ..core.state import Concretize
+
+            def setstate(state, _value):
+                """ Roll back PC to redo last instruction """
+                state.cpu.PC = state.cpu._last_pc
+
+            raise Concretize(
+                "Forking on memory safety", expression=crashing_condition, setstate=setstate
+            )
+        elif any(crash_or_not):
             raise InvalidSymbolicMemoryAccess(address, access, size, crashing_condition)
 
         return solutions

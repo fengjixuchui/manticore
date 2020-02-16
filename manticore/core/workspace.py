@@ -9,10 +9,11 @@ import io
 from contextlib import contextmanager
 
 try:
-    from contextlib import nullcontext
+    # nullcontext is not present before Python 3.7
+    from contextlib import nullcontext  # type: ignore
 except ImportError:
 
-    class nullcontext:
+    class nullcontext:  # type: ignore
         def __init__(self, enter_result=None):
             self.enter_result = enter_result
 
@@ -31,6 +32,7 @@ from ..utils import config
 from ..utils.helpers import PickleSerializer
 from .smtlib.solver import Z3Solver
 from .state import StateBase
+from ..exceptions import ManticoreError
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +292,8 @@ class FilesystemStore(Store):
         :param str key: The file to delete
         """
         path = os.path.join(self.uri, key)
-        os.remove(path)
+        if os.path.exists(path):
+            os.remove(path)
 
     def ls(self, glob_str):
         """
@@ -341,7 +344,7 @@ class MemoryStore(Store):
     @contextmanager
     def stream(self, key, mode="r", lock=False):
         if lock:
-            raise Exception("mem: does not support concurrency")
+            raise ManticoreError("mem: does not support concurrency")
         if "b" in mode:
             s = io.BytesIO(self._data.get(key, b""))
         else:

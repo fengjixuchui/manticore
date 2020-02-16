@@ -18,15 +18,15 @@ import threading
 import collections
 import shlex
 import time
+from typing import Dict, Tuple
 from subprocess import PIPE, Popen
 import re
-
 from . import operators as Operators
 from .constraints import *
 from .visitors import *
-from ...exceptions import Z3NotFoundError, SolverError, SolverUnknown, TooManySolutions
+from ...exceptions import Z3NotFoundError, SolverError, SolverUnknown, TooManySolutions, SmtlibError
 from ...utils import config
-from ...utils.helpers import issymbolic
+from . import issymbolic
 
 logger = logging.getLogger(__name__)
 consts = config.get_group("smt")
@@ -39,18 +39,21 @@ consts.add(
 )
 consts.add("z3_bin", default="z3", description="Z3 binary to use")
 consts.add("defaultunsat", default=True, description="Consider solver timeouts as unsat core")
+consts.add(
+    "optimize", default=True, description="Use smtlib command optimize to find min/max if available"
+)
 
 
 # Regular expressions used by the solver
-RE_GET_EXPR_VALUE_FMT = re.compile("\(\((?P<expr>(.*))\ #x(?P<value>([0-9a-fA-F]*))\)\)")
+RE_GET_EXPR_VALUE_FMT = re.compile(r"\(\((?P<expr>(.*))\ #x(?P<value>([0-9a-fA-F]*))\)\)")
 RE_OBJECTIVES_EXPR_VALUE = re.compile(
-    "\(objectives.*\((?P<expr>.*) (?P<value>\d*)\).*\).*", re.MULTILINE | re.DOTALL
+    r"\(objectives.*\((?P<expr>.*) (?P<value>\d*)\).*\).*", re.MULTILINE | re.DOTALL
 )
-RE_MIN_MAX_OBJECTIVE_EXPR_VALUE = re.compile("(?P<expr>.*?)\s+\|->\s+(?P<value>.*)", re.DOTALL)
+RE_MIN_MAX_OBJECTIVE_EXPR_VALUE = re.compile(r"(?P<expr>.*?)\s+\|->\s+(?P<value>.*)", re.DOTALL)
 
 
 class SingletonMixin(object):
-    __singleton_instances = {}
+    __singleton_instances: Dict[Tuple[int, int], "SingletonMixin"] = {}
 
     @classmethod
     def instance(cls):
@@ -59,6 +62,14 @@ class SingletonMixin(object):
         if not (pid, tid) in cls.__singleton_instances:
             cls.__singleton_instances[(pid, tid)] = cls()
         return cls.__singleton_instances[(pid, tid)]
+
+
+class SolverException(SmtlibError):
+    """
+    Solver exception
+    """
+
+    pass
 
 
 class Solver(SingletonMixin):
@@ -74,15 +85,15 @@ class Solver(SingletonMixin):
         :param X: a symbol or expression
         :param M: maximum number of iterations allowed
         """
-        raise Exception("Abstract method not implemented")
+        raise SmtlibError("Abstract method not implemented")
 
     def check(self, constraints) -> bool:
         """Check if given constraints can be valid"""
         return self.can_be_true(constraints, True)
 
-    def can_be_true(self, constraints, expression) -> bool:
+    def can_be_true(self, constraints, expression=True) -> bool:
         """Check if given expression could be valid"""
-        raise Exception("Abstract method not implemented")
+        raise SolverException("Abstract method not implemented")
 
     def must_be_true(self, constraints, expression) -> bool:
         """Check if expression is True and that it can not be False with current constraints"""
@@ -91,11 +102,11 @@ class Solver(SingletonMixin):
 
     def get_all_values(self, constraints, x, maxcnt=10000, silent=False):
         """Returns a list with all the possible values for the symbol x"""
-        raise Exception("Abstract method not implemented")
+        raise SolverException("Abstract method not implemented")
 
     def get_value(self, constraints, expression):
         """Ask the solver for one possible result of given expression using given set of constraints."""
-        raise Exception("Abstract method not implemented")
+        raise SolverException("Abstract method not implemented")
 
     def max(self, constraints, X: BitVec, M=10000):
         """
@@ -190,7 +201,12 @@ class Z3Solver(Solver):
             self._send("(get-info :version)")
             self._received_version = self._recv()
         key, version = shlex.split(self._received_version[1:-1])
-        return Version(*map(int, version.split(".")))
+        try:
+            parsed_version = Version(*map(int, version.split(" ", 1)[0].split(".")))
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Could not parse Z3 version: '{version}'. Assuming compatibility.")
+            parsed_version = Version(float("inf"), float("inf"), float("inf"))
+        return parsed_version
 
     def _start_proc(self):
         """Spawns z3 solver process"""
@@ -245,10 +261,10 @@ class Z3Solver(Solver):
 
     # marshaling/pickle
     def __getstate__(self):
-        raise Exception()
+        raise SolverException()
 
     def __setstate__(self, state):
-        raise Exception()
+        raise SolverException()
 
     def __del__(self):
         try:
@@ -305,7 +321,7 @@ class Z3Solver(Solver):
 
         # logger.debug('<%s', buf)
         if "(error" in bufl[0]:
-            raise Exception(f"Error in smtlib: {bufl[0]}")
+            raise SolverException(f"Error in smtlib: {bufl[0]}")
         return buf
 
     def __readline_and_count(self):
@@ -385,7 +401,7 @@ class Z3Solver(Solver):
         """Recall the last pushed constraint store and state."""
         self._send("(pop 1)")
 
-    def can_be_true(self, constraints, expression):
+    def can_be_true(self, constraints, expression=True):
         """Check if two potentially symbolic values can be equal"""
         if isinstance(expression, bool):
             if not expression:
@@ -430,9 +446,9 @@ class Z3Solver(Solver):
 
             temp_cs.add(var == expression)
             self._reset(temp_cs.to_string(related_to=var))
-
             result = []
 
+            start = time.time()
             while self._is_sat():
                 value = self._getvalue(var)
                 result.append(value)
@@ -447,10 +463,11 @@ class Z3Solver(Solver):
                         break
                     else:
                         raise TooManySolutions(result)
-
+                if time.time() - start > consts.timeout:
+                    raise SolverError("Timeout")
             return result
 
-    def optimize(self, constraints: ConstraintSet, x: BitVec, goal: str, M=10000):
+    def optimize(self, constraints: ConstraintSet, x: BitVec, goal: str, max_iter=10000):
         """
         Iteratively finds the maximum or minimum value for the operation
         (Normally Operators.UGT or Operators.ULT)
@@ -458,10 +475,10 @@ class Z3Solver(Solver):
         :param constraints: constraints to take into account
         :param x: a symbol or expression
         :param goal: goal to achieve, either 'maximize' or 'minimize'
-        :param M: maximum number of iterations allowed
+        :param max_iter: maximum number of iterations allowed
         """
+        # TODO: consider adding a mode to return best known value on timeout
         assert goal in ("maximize", "minimize")
-        assert isinstance(x, BitVec)
         operation = {"maximize": Operators.UGE, "minimize": Operators.ULE}[goal]
 
         with constraints as temp_cs:
@@ -471,7 +488,8 @@ class Z3Solver(Solver):
             self._reset(temp_cs.to_string(related_to=X))
             self._send(aux.declaration)
 
-            if getattr(self, f"support_{goal}"):
+            start = time.time()
+            if consts.optimize and getattr(self, f"support_{goal}", False):
                 self._push()
                 try:
                     self._assert(operation(X, aux))
@@ -483,89 +501,152 @@ class Z3Solver(Solver):
                         # This will be a line like NAME |-> VALUE
                         maybe_sat = self._recv()
                         if maybe_sat == "sat":
-                            m = RE_MIN_MAX_OBJECTIVE_EXPR_VALUE.match(_status)
-                            expr, value = m.group("expr"), m.group("value")
-                            assert expr == aux.name
-                            return int(value)
+                            match = RE_MIN_MAX_OBJECTIVE_EXPR_VALUE.match(_status)
+                            if match:
+                                expr, value = match.group("expr"), match.group("value")
+                                assert expr == aux.name
+                                return int(value)
+                            else:
+                                raise SolverError("Could not match MinMax objective value regex")
                     elif _status == "sat":
                         ret = self._recv()
                         if not (ret.startswith("(") and ret.endswith(")")):
                             raise SolverError("bad output on max, z3 may have been killed")
 
-                        m = RE_OBJECTIVES_EXPR_VALUE.match(ret)
-                        expr, value = m.group("expr"), m.group("value")
-                        assert expr == aux.name
-                        return int(value)
+                        match = RE_OBJECTIVES_EXPR_VALUE.match(ret)
+                        if match:
+                            expr, value = match.group("expr"), match.group("value")
+                            assert expr == aux.name
+                            return int(value)
+                        else:
+                            raise SolverError("Could not match objective value regex")
                 finally:
                     self._pop()
                     self._reset(temp_cs)
                     self._send(aux.declaration)
 
-            operation = {"maximize": Operators.UGT, "minimize": Operators.ULT}[goal]
+            operation = {"maximize": Operators.UGE, "minimize": Operators.ULE}[goal]
             self._assert(aux == X)
+
+            # Find one value and use it as currently known min/Max
+            if not self._is_sat():
+                raise SolverException("UNSAT")
+            last_value = self._getvalue(aux)
+            self._assert(operation(aux, last_value))
+
+            # This uses a binary search to find a suitable range for aux
+            # Use known solution as min or max depending on the goal
+            if goal == "maximize":
+                m, M = last_value, (1 << x.size) - 1
+            else:
+                m, M = 0, last_value
+
+            # Iteratively divide the range
+            L = None
+            while L not in (M, m):
+                L = (m + M) // 2
+                self._push()
+                try:
+                    self._assert(operation(aux, L))
+                    sat = self._is_sat()
+                finally:
+                    self._pop()
+
+                # depending on the goal move one of the extremes
+                if goal == "maximize" and sat or goal == "minimize" and not sat:
+                    m = L
+                else:
+                    M = L
+
+                if time.time() - start > consts.timeout:
+                    raise SolverError("Timeout")
+
+            # At this point we know aux is inside [m,M]
+            # Lets constrain it to that range
+            self._assert(Operators.UGE(aux, m))
+            self._assert(Operators.ULE(aux, M))
+
+            # And now check all remaining possible extremes
             last_value = None
             i = 0
             while self._is_sat():
                 last_value = self._getvalue(aux)
                 self._assert(operation(aux, last_value))
+                self._assert(aux != last_value)
                 i = i + 1
-                if i > M:
+                if i > max_iter:
                     raise SolverError("Optimizing error, maximum number of iterations was reached")
+                if time.time() - start > consts.timeout:
+                    raise SolverError("Timeout")
             if last_value is not None:
                 return last_value
             raise SolverError("Optimizing error, unsat or unknown core")
 
-    def get_value(self, constraints, expression):
+    def get_value(self, constraints, *expressions):
         """
-        Ask the solver for one possible result of given expression using given set of constraints.
+        Ask the solver for one possible result of given expressions using
+        given set of constraints.
         """
-        if not issymbolic(expression):
-            return expression
-        assert isinstance(expression, (Bool, BitVec, Array))
+        values = []
+        start = time.time()
         with constraints as temp_cs:
-            if isinstance(expression, Bool):
-                var = temp_cs.new_bool()
-            elif isinstance(expression, BitVec):
-                var = temp_cs.new_bitvec(expression.size)
-            elif isinstance(expression, Array):
-                var = []
-                result = []
-                for i in range(expression.index_max):
-                    subvar = temp_cs.new_bitvec(expression.value_bits)
-                    var.append(subvar)
-                    temp_cs.add(subvar == simplify(expression[i]))
+            for expression in expressions:
+                if not issymbolic(expression):
+                    values.append(expression)
+                    continue
+                assert isinstance(expression, (Bool, BitVec, Array))
+                if isinstance(expression, Bool):
+                    var = temp_cs.new_bool()
+                elif isinstance(expression, BitVec):
+                    var = temp_cs.new_bitvec(expression.size)
+                elif isinstance(expression, Array):
+                    var = []
+                    result = []
+                    for i in range(expression.index_max):
+                        subvar = temp_cs.new_bitvec(expression.value_bits)
+                        var.append(subvar)
+                        temp_cs.add(subvar == simplify(expression[i]))
+
+                    self._reset(temp_cs)
+                    if not self._is_sat():
+                        raise SolverError("Model is not available")
+
+                    for i in range(expression.index_max):
+                        self._send("(get-value (%s))" % var[i].name)
+                        ret = self._recv()
+                        assert ret.startswith("((") and ret.endswith("))")
+                        pattern, base = self._get_value_fmt
+                        m = pattern.match(ret)
+                        expr, value = m.group("expr"), m.group("value")
+                        result.append(int(value, base))
+                    values.append(bytes(result))
+                    if time.time() - start > consts.timeout:
+                        raise SolverError("Timeout")
+                    continue
+
+                temp_cs.add(var == expression)
 
                 self._reset(temp_cs)
+
                 if not self._is_sat():
                     raise SolverError("Model is not available")
 
-                for i in range(expression.index_max):
-                    self._send("(get-value (%s))" % var[i].name)
-                    ret = self._recv()
-                    assert ret.startswith("((") and ret.endswith("))")
+                self._send("(get-value (%s))" % var.name)
+                ret = self._recv()
+                if not (ret.startswith("((") and ret.endswith("))")):
+                    raise SolverError("SMTLIB error parsing response: %s" % ret)
+
+                if isinstance(expression, Bool):
+                    values.append({"true": True, "false": False}[ret[2:-2].split(" ")[1]])
+                if isinstance(expression, BitVec):
                     pattern, base = self._get_value_fmt
                     m = pattern.match(ret)
                     expr, value = m.group("expr"), m.group("value")
-                    result.append(int(value, base))
-                return bytes(result)
+                    values.append(int(value, base))
+            if time.time() - start > consts.timeout:
+                raise SolverError("Timeout")
 
-            temp_cs.add(var == expression)
-
-            self._reset(temp_cs)
-
-        if not self._is_sat():
-            raise SolverError("Model is not available")
-
-        self._send("(get-value (%s))" % var.name)
-        ret = self._recv()
-        if not (ret.startswith("((") and ret.endswith("))")):
-            raise SolverError("SMTLIB error parsing response: %s" % ret)
-
-        if isinstance(expression, Bool):
-            return {"true": True, "false": False}[ret[2:-2].split(" ")[1]]
-        if isinstance(expression, BitVec):
-            pattern, base = self._get_value_fmt
-            m = pattern.match(ret)
-            expr, value = m.group("expr"), m.group("value")
-            return int(value, base)
-        raise NotImplementedError("get_value only implemented for Bool and BitVec")
+        if len(expressions) == 1:
+            return values[0]
+        else:
+            return values

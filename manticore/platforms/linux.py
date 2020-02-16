@@ -2,6 +2,7 @@ import binascii
 import ctypes
 import errno
 import fcntl
+import itertools
 import logging
 import socket
 import struct
@@ -21,18 +22,16 @@ from elftools.elf.sections import SymbolTableSection
 from . import linux_syscalls
 from .linux_syscall_stubs import SyscallStubs
 from ..core.state import TerminateState
-from ..core.smtlib import ConstraintSet, Operators, Expression
+from ..core.smtlib import ConstraintSet, Operators, Expression, issymbolic
 from ..core.smtlib.solver import Z3Solver
 from ..exceptions import SolverError
 from ..native.cpu.abstractcpu import Syscall, ConcretizeArgument, Interruption
 from ..native.cpu.cpufactory import CpuFactory
 from ..native.memory import SMemory32, SMemory64, Memory32, Memory64, LazySMemory32, LazySMemory64
 from ..platforms.platform import Platform, SyscallNotImplemented, unimplemented
-from ..utils.helpers import issymbolic
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
 MixedSymbolicBuffer = Union[List[Union[bytes, Expression]], bytes]
 
 
@@ -435,6 +434,10 @@ class Linux(Platform):
     # from /usr/include/asm-generic/resource.h
     FCNTL_FDCWD = -100  # /* Special value used to indicate openat should use the cwd */
 
+    # Hard-coded base load address for dynamic elf binaries (ET_DYN in pyelftools)
+    BASE_DYN_ADDR_32 = 0x56555000
+    BASE_DYN_ADDR = 0x555555554000
+
     def __init__(self, program, argv=None, envp=None, disasm="capstone", **kwargs):
         """
         Builds a Linux OS platform
@@ -450,6 +453,8 @@ class Linux(Platform):
         self.program = program
         self.clocks = 0
         self.files = []
+        # A cache for keeping state when reading directories { fd: dent_iter }
+        self._getdents_c = {}
         self._closed_files = []
         self.syscall_trace = []
         # Many programs to support SLinux
@@ -609,6 +614,7 @@ class Linux(Platform):
             else:
                 state_files.append(("File", fd))
         state["files"] = state_files
+        state["_getdents_c"] = self._getdents_c
         state["closed_files"] = self._closed_files
         state["rlimits"] = self._rlimits
 
@@ -659,9 +665,15 @@ class Linux(Platform):
             else:
                 self.files.append(file_or_buffer)
 
-        self.files[0].peer = self.output
-        self.files[1].peer = self.output
-        self.files[2].peer = self.output
+        # If file descriptors for stdin/stdout/stderr aren't closed, propagate them
+        if self.files[0]:
+            self.files[0].peer = self.output
+        if self.files[1]:
+            self.files[1].peer = self.output
+        if self.files[2]:
+            self.files[2].peer = self.output
+
+        self._getdents_c = state["_getdents_c"]
         self._closed_files = state["closed_files"]
         self.input.peer = self.files[0]
         self._rlimits = state["rlimits"]
@@ -934,7 +946,7 @@ class Linux(Platform):
         cpu = self.current
         elf = self.elf
         arch = self.arch
-        env = dict(var.split("=") for var in env if "=" in var)
+        env = dict(var.split("=", 1) for var in env if "=" in var)
         addressbitsize = {"x86": 32, "x64": 64, "ARM": 32, "AArch64": 64}[elf.get_machine_arch()]
         logger.debug("Loading %s as a %s elf", filename, arch)
 
@@ -942,12 +954,22 @@ class Linux(Platform):
 
         # Get interpreter elf
         interpreter = None
+
+        # Need to clean up when we are done
+        def _clean_interp_stream():
+            if interpreter is not None:
+                try:
+                    interpreter.stream.close()
+                except IOError as e:
+                    logger.error(str(e))
+
         for elf_segment in elf.iter_segments():
             if elf_segment.header.p_type != "PT_INTERP":
                 continue
             interpreter_filename = elf_segment.data()[:-1]
             logger.info(f"Interpreter filename: {interpreter_filename}")
             if os.path.exists(interpreter_filename.decode("utf-8")):
+                _clean_interp_stream()
                 interpreter = ELFFile(open(interpreter_filename, "rb"))
             elif "LD_LIBRARY_PATH" in env:
                 for mpath in env["LD_LIBRARY_PATH"].split(":"):
@@ -956,6 +978,7 @@ class Linux(Platform):
                     )
                     logger.info(f"looking for interpreter {interpreter_path_filename}")
                     if os.path.exists(interpreter_path_filename):
+                        _clean_interp_stream()
                         interpreter = ELFFile(open(interpreter_path_filename, "rb"))
                         break
             break
@@ -999,9 +1022,9 @@ class Linux(Platform):
             if base == 0 and elf.header.e_type == "ET_DYN":
                 assert vaddr == 0
                 if addressbitsize == 32:
-                    base = 0x56555000
+                    base = self.BASE_DYN_ADDR_32
                 else:
-                    base = 0x555555554000
+                    base = self.BASE_DYN_ADDR
 
             perms = perms_from_elf(flags)
             hint = base + vaddr
@@ -1165,6 +1188,9 @@ class Linux(Platform):
             "AT_EXECFN": at_execfn,  # Filename of executable.
         }
 
+        # Clean up interpreter ELFFile
+        _clean_interp_stream()
+
     def _to_signed_dword(self, dword):
         arch_width = self.current.address_bit_size
         if arch_width == 32:
@@ -1229,7 +1255,7 @@ class Linux(Platform):
         else:
             return self.files[fd]
 
-    def _transform_write_data(self, data: T) -> T:
+    def _transform_write_data(self, data: bytes) -> bytes:
         """
         Implement in subclass to transform data written by write(2)/writev(2)
         Nop by default.
@@ -1865,6 +1891,10 @@ class Linux(Platform):
         :param size: the size of the portion to unmap.
         :return: C{0} on success.
         """
+        if issymbolic(addr):
+            raise ConcretizeArgument(self, 0)
+        if issymbolic(size):
+            raise ConcretizeArgument(self, 1)
         self.current.memory.munmap(addr, size)
         return 0
 
@@ -1951,6 +1981,9 @@ class Linux(Platform):
         for i in range(0, count):
             buf = cpu.read_int(iov + i * sizeof_iovec, ptrsize)
             size = cpu.read_int(iov + i * sizeof_iovec + (sizeof_iovec // 2), ptrsize)
+
+            if issymbolic(size):
+                size = Z3Solver().get_value(self.constraints, size)
 
             data = [Operators.CHR(cpu.read_int(buf + i, 8)) for i in range(size)]
             data = self._transform_write_data(data)
@@ -2100,20 +2133,35 @@ class Linux(Platform):
         fd = self._open(sock)
         return fd
 
-    def sys_recv(self, sockfd, buf, count, flags):
+    def sys_recv(self, sockfd, buf, count, flags, trace_str="_recv"):
+        data: bytes = bytes()
+        if not self.current.memory.access_ok(slice(buf, buf + count), "w"):
+            logger.info("RECV: buf within invalid memory. Returning EFAULT")
+            return -errno.EFAULT
+
         try:
-            sock = self.files[sockfd]
-        except IndexError:
-            return -errno.EINVAL
+            sock = self._get_fd(sockfd)
+        except FdError:
+            return -errno.EBADF
 
         if not isinstance(sock, Socket):
             return -errno.ENOTSOCK
 
         data = sock.read(count)
+        self.syscall_trace.append((trace_str, sockfd, data))
         self.current.write_bytes(buf, data)
-        self.syscall_trace.append(("_recv", sockfd, data))
 
         return len(data)
+
+    def sys_recvfrom(self, sockfd, buf, count, flags, src_addr, addrlen):
+        if src_addr != 0:
+            logger.warning("sys_recvfrom: Unimplemented non-NULL src_addr")
+
+        if addrlen != 0:
+            logger.warning("sys_recvfrom: Unimplemented non-NULL addrlen")
+
+        # TODO Unimplemented src_addr and addrlen, so act like sys_recv
+        return self.sys_recv(sockfd, buf, count, flags, trace_str="_recvfrom")
 
     def sys_send(self, sockfd, buf, count, flags):
         try:
@@ -2219,7 +2267,7 @@ class Linux(Platform):
             if name is not None:
                 raise SyscallNotImplemented(index, name)
             else:
-                raise Exception(f"Bad syscall index, {index}")
+                raise EnvironmentError(f"Bad syscall index, {index}")
 
         return self._syscall_abi.invoke(implementation)
 
@@ -2521,10 +2569,10 @@ class Linux(Platform):
         bufstat += add(4, stat.st_uid)  # unsigned long   st_uid;
         bufstat += add(4, stat.st_gid)  # unsigned long   st_gid;
         bufstat += add(8, stat.st_rdev)  # unsigned long long st_rdev;
-        bufstat += add(8, 0)  # unsigned long long __pad1;
+        bufstat += add(4, 0)  # unsigned long long __pad1;
         bufstat += add(8, stat.st_size)  # long long       st_size;
         bufstat += add(4, stat.st_blksize)  # int   st_blksize;
-        bufstat += add(4, 0)  # int   __pad2;
+        # bufstat += add(4, 0)  # int   __pad2;
         bufstat += add(8, stat.st_blocks)  # unsigned long long st_blocks;
         bufstat += to_timespec(stat.st_atime)  # unsigned long   st_atime;
         bufstat += to_timespec(stat.st_mtime)  # unsigned long   st_mtime;
@@ -2605,6 +2653,7 @@ class Linux(Platform):
             l, r = Socket.pair()
             self.current.write_int(filedes, self._open(l))
             self.current.write_int(filedes + 4, self._open(r))
+            return 0
         else:
             logger.warning("sys_pipe2 doesn't handle flags")
             return -1
@@ -2664,19 +2713,47 @@ class Linux(Platform):
             logger.info("Can't get directory entries for a file")
             return -1
 
-        with os.scandir(file.path) as dent_iter:
-            for index, item in zip(range(count), dent_iter):
-                fmt = f"LLH{len(item.name) + 1}sxc"
-                size = struct.calcsize(fmt)
+        if fd not in self._getdents_c:
+            # First call on this file descriptor
+            self._getdents_c[fd] = os.scandir(file.path)
 
-                stat = item.stat()
-                print("FILE MODE:", item.name, " :: ", stat.st_mode)
+        dent_iter = self._getdents_c[fd]
 
-                buf += struct.pack(
-                    fmt, item.inode(), size, size, bytes(item.name, "utf-8") + b"\x00", b"\x00"
-                )
+        item = next(dent_iter, None)
+        while item is not None:
+            fmt = f"LLH{len(item.name) + 1}sB"
+            size = struct.calcsize(fmt)
+            if len(buf) + size > count:
+                # Don't overflow buffer
+                break
 
-        self.current.write_bytes(dirent, buf)
+            stat = item.stat()
+            print(f"FILE MODE: {item.name} :: {stat.st_mode:o}")
+
+            # https://elixir.bootlin.com/linux/v5.1.15/source/include/linux/fs_types.h#L27
+            d_type = (stat.st_mode >> 12) & 15
+
+            packed = struct.pack(
+                fmt, item.inode(), size, size, bytes(item.name, "utf-8") + b"\x00", d_type
+            )
+            buf += packed
+            item = next(dent_iter, None)
+
+        if item:
+            # Prepend the last valid item that didn't fit to the list for next time
+            self._getdents_c[fd] = itertools.chain([item], dent_iter)
+        else:
+            # If everything fit, then save just the dent_iter
+            self._getdents_c[fd] = dent_iter
+
+        if len(buf) > 0:
+            # Write out to buffer if we have something to write
+            self.current.write_bytes(dirent, buf)
+        else:  # len(buf) == 0
+            # When the buffer is 0, that means we've read all directory entries
+            # Delete the state and don't write a zero buffer back to dirent
+            del self._getdents_c[fd]
+
         return len(buf)
 
     def sys_nanosleep(self, rqtp, rmtp) -> int:
@@ -2897,7 +2974,7 @@ class SLinux(Linux):
 
         return super().sys_write(fd, buf, count)
 
-    def sys_recv(self, sockfd, buf, count, flags):
+    def sys_recv(self, sockfd, buf, count, flags, trace_str="_recv"):
         if issymbolic(sockfd):
             logger.debug("Ask to read from a symbolic file descriptor!!")
             raise ConcretizeArgument(self, 0)
@@ -2916,6 +2993,33 @@ class SLinux(Linux):
 
         return super().sys_recv(sockfd, buf, count, flags)
 
+    def sys_recvfrom(self, sockfd, buf, count, flags, src_addr, addrlen):
+        if issymbolic(sockfd):
+            logger.debug("Ask to read from a symbolic file descriptor!!")
+            raise ConcretizeArgument(self, 0)
+
+        if issymbolic(buf):
+            logger.debug("Ask to read to a symbolic buffer")
+            raise ConcretizeArgument(self, 1)
+
+        if issymbolic(count):
+            logger.debug("Ask to read a symbolic number of bytes ")
+            raise ConcretizeArgument(self, 2)
+
+        if issymbolic(flags):
+            logger.debug("Submitted a symbolic flags")
+            raise ConcretizeArgument(self, 3)
+
+        if issymbolic(src_addr):
+            logger.debug("Submitted a symbolic source address")
+            raise ConcretizeArgument(self, 4)
+
+        if issymbolic(addrlen):
+            logger.debug("Submitted a symbolic address length")
+            raise ConcretizeArgument(self, 5)
+
+        return super().sys_recvfrom(sockfd, buf, count, flags, src_addr, addrlen)
+
     def sys_accept(self, sockfd, addr, addrlen):
         # TODO(yan): Transmit some symbolic bytes as soon as we start.
         # Remove this hack once no longer needed.
@@ -2925,7 +3029,9 @@ class SLinux(Linux):
             return fd
         sock = self._get_fd(fd)
         nbytes = 32
-        symb = self.constraints.new_array(name=f"socket{fd}", index_max=nbytes)
+        symb = self.constraints.new_array(
+            name=f"socket{fd}", index_max=nbytes, avoid_collisions=True
+        )
         for i in range(nbytes):
             sock.buffer.append(symb[i])
         return fd
@@ -3036,7 +3142,7 @@ class SLinux(Linux):
                     solve_to_fd(data, out)
                 elif fd == 2:
                     solve_to_fd(data, err)
-            if name in ("_recv"):
+            if name in ("_recv", "_recvfrom"):
                 solve_to_fd(data, net)
             if name in ("_receive", "_read") and fd == 0:
                 solve_to_fd(data, inn)

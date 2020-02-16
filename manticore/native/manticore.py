@@ -12,9 +12,8 @@ from elftools.elf.sections import SymbolTableSection
 from .state import State
 from ..core.manticore import ManticoreBase
 from ..core.smtlib import ConstraintSet
-from ..core.smtlib.solver import Z3Solver
+from ..core.smtlib.solver import Z3Solver, issymbolic
 from ..utils import log, config
-from ..utils.helpers import issymbolic
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +45,7 @@ class Manticore(ManticoreBase):
         self.trace = None
         # sugar for 'will_execute_instruction"
         self._hooks = {}
+        self._after_hooks = {}
         self._init_hooks = set()
 
         # self.subscribe('will_generate_testcase', self._generate_testcase_callback)
@@ -138,7 +138,7 @@ class Manticore(ManticoreBase):
                 **kwargs,
             )
         except elftools.common.exceptions.ELFError:
-            raise Exception(f"Invalid binary: {path}")
+            raise ManticoreError(f"Invalid binary: {path}")
 
     @classmethod
     def decree(cls, path, concrete_start="", **kwargs):
@@ -154,7 +154,7 @@ class Manticore(ManticoreBase):
         try:
             return cls(_make_decree(path, concrete_start), **kwargs)
         except KeyError:  # FIXME(mark) magic parsing for DECREE should raise better error
-            raise Exception(f"Invalid binary: {path}")
+            raise ManticoreError(f"Invalid binary: {path}")
 
     @property
     def binary_path(self):
@@ -213,7 +213,7 @@ class Manticore(ManticoreBase):
             self.subscribe("will_run", self._init_callback)
         return f
 
-    def hook(self, pc):
+    def hook(self, pc, after=False):
         """
         A decorator used to register a hook function for a given instruction address.
         Equivalent to calling :func:`~add_hook`.
@@ -223,12 +223,12 @@ class Manticore(ManticoreBase):
         """
 
         def decorator(f):
-            self.add_hook(pc, f)
+            self.add_hook(pc, f, after)
             return f
 
         return decorator
 
-    def add_hook(self, pc, callback):
+    def add_hook(self, pc, callback, after=False):
         """
         Add a callback to be invoked on executing a program counter. Pass `None`
         for pc to invoke callback on every instruction. `callback` should be a callable
@@ -241,9 +241,14 @@ class Manticore(ManticoreBase):
         if not (isinstance(pc, int) or pc is None):
             raise TypeError(f"pc must be either an int or None, not {pc.__class__.__name__}")
         else:
-            self._hooks.setdefault(pc, set()).add(callback)
-            if self._hooks:
-                self.subscribe("will_execute_instruction", self._hook_callback)
+            hooks, when, hook_callback = (
+                (self._hooks, "will_execute_instruction", self._hook_callback)
+                if not after
+                else (self._after_hooks, "did_execute_instruction", self._after_hook_callback)
+            )
+            hooks.setdefault(pc, set()).add(callback)
+            if hooks:
+                self.subscribe(when, hook_callback)
 
     def _hook_callback(self, state, pc, instruction):
         "Invoke all registered generic hooks"
@@ -261,6 +266,17 @@ class Manticore(ManticoreBase):
 
         # Invoke all pc-agnostic hooks
         for cb in self._hooks.get(None, []):
+            cb(state)
+
+    def _after_hook_callback(self, state, last_pc, pc, instruction):
+        "Invoke all registered generic hooks"
+
+        # Invoke all pc-specific hooks
+        for cb in self._after_hooks.get(last_pc, []):
+            cb(state)
+
+        # Invoke all pc-agnostic hooks
+        for cb in self._after_hooks.get(None, []):
             cb(state)
 
     def _init_callback(self, ready_states):
@@ -308,8 +324,8 @@ class Manticore(ManticoreBase):
     def run(self, timeout=None):
         with self.locked_context() as context:
             context["time_started"] = time.time()
-
-        super().run(timeout=timeout)
+        with self.kill_timeout(timeout):
+            super().run()
 
     def finalize(self):
         super().finalize()
@@ -387,7 +403,7 @@ def _make_linux(
         entry_pc = platform._find_symbol(entry_symbol)
         if entry_pc is None:
             logger.error("No symbol for '%s' in %s", entry_symbol, program)
-            raise Exception("Symbol not found")
+            raise ManticoreError("Symbol not found")
         else:
             logger.info("Found symbol '%s' (%x)", entry_symbol, entry_pc)
             # TODO: use argv as arguments for function

@@ -1,6 +1,6 @@
 # Exports (for `from manticore.ethereum import ...`)
 from .abi import ABI
-from .manticore import ManticoreEVM
+from .manticore import ManticoreEVM, config
 from .state import State
 from .detectors import (
     Detector,
@@ -16,9 +16,9 @@ from .detectors import (
     DetectUninitializedMemory,
     DetectUninitializedStorage,
     DetectRaceCondition,
+    DetectManipulableBalance,
 )
 from .account import EVMAccount, EVMContract
-from .abi import ABI
 from .solidity import SolidityMetadata
 
 from ..exceptions import NoAliveStates, EthereumError

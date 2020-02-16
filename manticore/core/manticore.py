@@ -4,6 +4,7 @@ import sys
 import time
 import random
 import weakref
+from typing import Callable
 
 from contextlib import contextmanager
 
@@ -14,10 +15,12 @@ from ..core.plugin import Plugin
 from ..core.smtlib import Expression
 from ..core.state import StateBase
 from ..core.workspace import ManticoreOutput
+from ..exceptions import ManticoreError
 from ..utils import config
-from ..utils.log import set_verbosity
+from ..utils.deprecated import deprecated
 from ..utils.event import Eventful
 from ..utils.helpers import PickleSerializer
+from ..utils.log import set_verbosity
 from ..utils.nointerrupt import WithKeyboardInterruptAs
 from .workspace import Workspace
 from .worker import WorkerSingle, WorkerThread, WorkerProcess
@@ -57,30 +60,39 @@ consts.add(
     description="If True enables to run workers over the network UNIMPLEMENTED",
 )
 consts.add("procs", default=10, description="Number of parallel processes to spawn")
+
+proc_type = MProcessingType.multiprocessing
+if sys.platform != "linux":
+    logger.warning("Manticore is only supported on Linux. Proceed at your own risk!")
+    proc_type = MProcessingType.threading
+
 consts.add(
     "mprocessing",
-    default=MProcessingType.multiprocessing,
-    description="single: No multiprocessing at all. Single process.\n threading: use threads\m multiprocessing: use forked processes",
+    default=proc_type,
+    description="single: No multiprocessing at all. Single process.\n threading: use threads\n multiprocessing: use forked processes",
+)
+consts.add(
+    "seed",
+    default=random.getrandbits(32),
+    description="The seed to use when randomly selecting states",
 )
 
 
 class ManticoreBase(Eventful):
     def __new__(cls, *args, **kwargs):
         if cls in (ManticoreBase, ManticoreSingle, ManticoreThreading, ManticoreMultiprocessing):
-            raise Exception("Should not instantiate this")
+            raise ManticoreError("Should not instantiate this")
 
         cl = consts.mprocessing.to_class()
-        if cl not in cls.__bases__:
-            # change ManticoreBase for the more specific class
-            idx = cls.__bases__.index(ManticoreBase)
-            bases = list(cls.__bases__)
-            bases[idx] = cl
-            cls.__bases__ = tuple(bases)
+        # change ManticoreBase for the more specific class
+        bases = {cl if issubclass(base, ManticoreBase) else base for base in cls.__bases__}
+        cls.__bases__ = tuple(bases)
 
+        random.seed(consts.seed)
         return super().__new__(cls)
 
     # Decorators added first for convenience.
-    def sync(func):
+    def sync(func: Callable) -> Callable:  # type: ignore
         """Synchronization decorator"""
 
         @functools.wraps(func)
@@ -90,7 +102,7 @@ class ManticoreBase(Eventful):
 
         return newFunction
 
-    def at_running(func):
+    def at_running(func: Callable) -> Callable:  # type: ignore
         """Allows the decorated method to run only when manticore is actively
            exploring states
         """
@@ -98,12 +110,12 @@ class ManticoreBase(Eventful):
         @functools.wraps(func)
         def newFunction(self, *args, **kw):
             if not self.is_running():
-                raise Exception(f"{func.__name__} only allowed while exploring states")
+                raise ManticoreError(f"{func.__name__} only allowed while exploring states")
             return func(self, *args, **kw)
 
         return newFunction
 
-    def at_not_running(func):
+    def at_not_running(func: Callable) -> Callable:  # type: ignore
         """Allows the decorated method to run only when manticore is NOT
            exploring states
         """
@@ -111,7 +123,8 @@ class ManticoreBase(Eventful):
         @functools.wraps(func)
         def newFunction(self, *args, **kw):
             if self.is_running():
-                raise Exception(f"{func.__name__} only allowed while NOT exploring states")
+                logger.error("Calling at running not allowed")
+                raise ManticoreError(f"{func.__name__} only allowed while NOT exploring states")
             return func(self, *args, **kw)
 
         return newFunction
@@ -126,6 +139,7 @@ class ManticoreBase(Eventful):
         "terminate_state",
         "kill_state",
         "execute_instruction",
+        "terminate_execution",
     }
 
     def __init__(self, initial_state, workspace_url=None, policy="random", **kwargs):
@@ -135,31 +149,33 @@ class ManticoreBase(Eventful):
                Manticore symbolically explores program states.
 
 
-        Manticore phases
-        ****************
+        **Manticore phases**
 
         Manticore has multiprocessing capabilities. Several worker processes
         could be registered to do concurrent exploration of the READY states.
         Manticore can be itself at different phases: STANDBY, RUNNING.
 
+        .. code-block:: none
+
                       +---------+               +---------+
                 ----->| STANDBY +<------------->+ RUNNING |
                       +---------+               +----+----+
 
-        = Phase STANDBY =
+        *Phase STANDBY*
+
         Manticore starts at STANDBY with a single initial state. Here the user
         can inspect, modify and generate testcases for the different states. The
         workers are paused and not doing any work. Actions: run()
 
 
-        = Phase RUNNING =
+        *Phase RUNNING*
+
         At RUNNING the workers consume states from the READY state list and
         potentially fork new states or terminate states. A RUNNING manticore can
         be stopped back to STANDBY. Actions: stop()
 
 
-        States and state lists
-        **********************
+        **States and state lists**
 
         A state contains all the information of the running program at a given
         moment. State snapshots are saved to the workspace often. Internally
@@ -167,12 +183,16 @@ class ManticoreBase(Eventful):
         of the state is then changed by the emulation of the specific arch.
         Stored snapshots are periodically updated using: _save() and _load().
 
+        .. code-block:: none
+
                       _save     +-------------+  _load
             State  +----------> |  WORKSPACE  +----------> State
                                 +-------------+
 
         During exploration Manticore spawns a number of temporary states that are
         maintained in different lists:
+
+        .. code-block:: none
 
                 Initial
                 State
@@ -190,8 +210,8 @@ class ManticoreBase(Eventful):
         At any given time a state must be at the READY, BUSY, TERMINATED or
         KILLED list.
 
-        State list: READY
-        =================
+        *State list: READY*
+
         The READY list holds all the runnable states. Internally a state is
         added to the READY list via method `_put_state(state)`. Workers take
         states from the READY list via the `_get_state(wait=True|False)` method.
@@ -200,8 +220,8 @@ class ManticoreBase(Eventful):
         KILLED
 
 
-        State list: BUSY
-        =================
+        *State list: BUSY*
+
         When a state is selected for exploration from the READY list it is
         marked as busy and put in the BUSY list. States being explored will be
         constantly modified  and only saved back to storage when moved out of
@@ -212,18 +232,18 @@ class ManticoreBase(Eventful):
         from all the lists.
 
 
-        State list: TERMINATED
-        ======================
+        *State list: TERMINATED*
+
         TERMINATED contains states that have reached a final condition and raised
-        TerminateState. Workers mainloop simpliy move the states that requested
+        TerminateState. Worker's mainloop simply moves the states that requested
         termination to the TERMINATED list. This is a final list.
 
         ```An inherited Manticore class like ManticoreEVM could internally revive
         the states in TERMINATED that pass some condition and move them back to
         READY so the user can apply a following transaction.```
 
-        State list: KILLED
-        ==================
+        *State list: KILLED*
+
         KILLED contains all the READY and BUSY states found at a cancel event.
         Manticore supports interactive analysis and has a prominetnt event system
         A useror ui can stop or cancel the exploration at any time. The unfinnished
@@ -253,7 +273,7 @@ class ManticoreBase(Eventful):
                 "_shared_context",
             )
         ):
-            raise Exception("Need to instantiate one of: ManticoreNative, ManticoreThreads..")
+            raise ManticoreError("Need to instantiate one of: ManticoreNative, ManticoreThreads..")
 
         # The workspace and the output
         # Manticore will use the workspace to save and share temporary states.
@@ -291,6 +311,23 @@ class ManticoreBase(Eventful):
     def __str__(self):
         return f"<{str(type(self))[8:-2]}| Alive States: {self.count_ready_states()}; Running States: {self.count_busy_states()} Terminated States: {self.count_terminated_states()} Killed States: {self.count_killed_states()} Started: {self._running.value} Killed: {self._killed.value}>"
 
+    @classmethod
+    def from_saved_state(cls, filename: str, *args, **kwargs):
+        """
+        Creates a Manticore object starting from a serialized state on the disk.
+
+        :param filename: File to load the state from
+        :param args: Arguments forwarded to the Manticore object
+        :param kwargs: Keyword args forwarded to the Manticore object
+        :return: An instance of a subclass of ManticoreBase with the given initial state
+        """
+        from ..utils.helpers import PickleSerializer
+
+        with open(filename, "rb") as fd:
+            deserialized = PickleSerializer().deserialize(fd)
+
+        return cls(deserialized, *args, **kwargs)
+
     def _fork(self, state, expression, policy="ALL", setstate=None):
         """
         Fork state on expression concretizations.
@@ -303,7 +340,7 @@ class ManticoreBase(Eventful):
                             (expression = ??)
 
                    Child1                         Child2
-            (expression = True)             (expression = True)
+            (expression = True)             (expression = False)
                setstate(True)                   setstate(False)
 
         The optional setstate() function is supposed to set the concrete value
@@ -313,7 +350,7 @@ class ManticoreBase(Eventful):
         to the ready list.
 
         """
-        assert isinstance(expression, Expression)
+        assert isinstance(expression, Expression), f"{type(expression)} is not an Expression"
 
         if setstate is None:
 
@@ -343,12 +380,8 @@ class ManticoreBase(Eventful):
                 setstate(new_state, new_value)
 
                 # enqueue new_state, assign new state id
-                new_state_id = self._save(new_state, state_id=None)
-                with self._lock:
-                    self._ready_states.append(new_state_id)
-                    self._lock.notify_all()  # Must notify one!
+                new_state_id = self._put_state(new_state)
 
-                self._publish("did_fork_state", new_state, expression, new_value, policy)
                 # maintain a list of children for logging purpose
                 children.append(new_state_id)
 
@@ -358,18 +391,21 @@ class ManticoreBase(Eventful):
             state._id = None
             self._lock.notify_all()
 
+        self._publish("did_fork_state", new_state, expression, new_value, policy)
+
         logger.debug("Forking current state %r into states %r", state.id, children)
 
     @staticmethod
+    @deprecated("Use utils.log.set_verbosity instead.")
     def verbosity(level):
         """ Sets global vervosity level.
             This will activate different logging profiles globally depending
             on the provided numeric value
         """
-        logger.info("Deprecated!")
         set_verbosity(level)
 
     # State storage
+    @Eventful.will_did("save_state")
     def _save(self, state, state_id=None):
         """ Store or update a state in secondary storage under state_id.
             Use a fresh id is None is provided.
@@ -382,6 +418,7 @@ class ManticoreBase(Eventful):
         state._id = self._workspace.save_state(state, state_id=state_id)
         return state.id
 
+    @Eventful.will_did("load_state")
     def _load(self, state_id):
         """ Load the state from the secondary storage
 
@@ -389,19 +426,17 @@ class ManticoreBase(Eventful):
             :type state_id: int
             :returns: the state id used
         """
-
         if not hasattr(self, "stcache"):
             self.stcache = weakref.WeakValueDictionary()
         if state_id in self.stcache:
             return self.stcache[state_id]
-        self._publish("will_load_state", state_id)
         state = self._workspace.load_state(state_id, delete=False)
         state._id = state_id
         self.forward_events_from(state, True)
-        self._publish("did_load_state", state, state_id)
         self.stcache[state_id] = state
         return state
 
+    @Eventful.will_did("remove_state")
     def _remove(self, state_id):
         """ Remove a state from secondary storage
 
@@ -500,7 +535,7 @@ class ManticoreBase(Eventful):
         """
         # wait for a state id to be added to the ready list and remove it
         if state_id not in self._busy_states:
-            raise Exception("Can not terminate. State is not being analyzed")
+            raise ManticoreError("Can not terminate. State is not being analyzed")
         self._busy_states.remove(state_id)
 
         if delete:
@@ -527,7 +562,7 @@ class ManticoreBase(Eventful):
         """
         # wait for a state id to be added to the ready list and remove it
         if state_id not in self._busy_states:
-            raise Exception("Can not even kill it. State is not being analyzed")
+            raise ManticoreError("Can not even kill it. State is not being analyzed")
         self._busy_states.remove(state_id)
 
         if delete:
@@ -539,7 +574,32 @@ class ManticoreBase(Eventful):
         # wake up everyone waiting for a change in the state lists
         self._lock.notify_all()
 
-    @property
+    @sync
+    def kill_state(self, state, delete=False):
+        """ Kill a state.
+             A state is moved from any list to the kill list or fully
+             removed from secondary storage
+
+            :param state_id: a estate id
+            :type state_id: int
+            :param delete: if true remove the state from the secondary storage
+            :type delete: bool
+        """
+        state_id = state.id
+        if state_id in self._busy_states:
+            self._busy_states.remove(state_id)
+        if state_id in self._terminated_states:
+            self._terminated_states.remove(state_id)
+        if state_id in self._ready_states:
+            self._ready_states.remove(state_id)
+
+        if delete:
+            self._remove(state_id)
+        else:
+            # add the state_id to the terminated list
+            self._killed_states.append(state_id)
+
+    @property  # type: ignore
     @sync
     def ready_states(self):
         """
@@ -551,13 +611,21 @@ class ManticoreBase(Eventful):
 
         This means it is not possible to change the state used by Manticore with `states = list(m.ready_states)`.
         """
-        for state_id in self._ready_states:
+        _ready_states = self._ready_states
+        for state_id in _ready_states:
             state = self._load(state_id)
             yield state
             # Re-save the state in case the user changed its data
             self._save(state, state_id=state_id)
 
     @property
+    def running_states(self):
+        logger.warning(
+            "manticore.running_states is deprecated! (You probably want manticore.ready_states)"
+        )
+        return self.ready_states
+
+    @property  # type: ignore
     @sync
     def terminated_states(self):
         """
@@ -571,7 +639,7 @@ class ManticoreBase(Eventful):
             # Re-save the state in case the user changed its data
             self._save(state, state_id=state_id)
 
-    @property
+    @property  # type: ignore
     @sync
     @at_not_running
     def killed_states(self):
@@ -586,23 +654,25 @@ class ManticoreBase(Eventful):
             # Re-save the state in case the user changed its data
             self._save(state, state_id=state_id)
 
-    @property
+    @property  # type: ignore
     @sync
     @at_not_running
     def _all_states(self):
         """ Only allowed at not running.
             (At running we can have states at busy)
+            Returns a tuple with all active state ids.
+            Notably the "killed" states are not included here.
         """
-        return (
-            tuple(self._ready_states) + tuple(self._terminated_states) + tuple(self._killed_states)
-        )
+        return tuple(self._ready_states) + tuple(self._terminated_states)
 
-    @property
+    @property  # type: ignore
     @sync
     def all_states(self):
         """
-        Iterates over the all states (ready and terminated and cancelled)
+        Iterates over the all states (ready and terminated)
         It holds a lock so no changes state lists are allowed
+
+        Notably the cancelled states are not included here.
 
         See also `ready_states`.
         """
@@ -616,6 +686,11 @@ class ManticoreBase(Eventful):
     def count_states(self):
         """ Total states count """
         return len(self._all_states)
+
+    @sync
+    def count_all_states(self):
+        """ Total states count """
+        return self.count_states()
 
     @sync
     def count_ready_states(self):
@@ -638,6 +713,8 @@ class ManticoreBase(Eventful):
         return len(self._terminated_states)
 
     def generate_testcase(self, state, message="test", name="test"):
+        if message == "test" and hasattr(state, "_terminated_by") and state._terminated_by:
+            message = str(state._terminated_by)
         testcase = self._output.testcase(prefix=name)
         with testcase.open_stream("pkl", binary=True) as statef:
             PickleSerializer().serialize(state, statef)
@@ -706,6 +783,7 @@ class ManticoreBase(Eventful):
                         )
 
         plugin.on_register()
+        return plugin
 
     @at_not_running
     def unregister_plugin(self, plugin):
@@ -725,7 +803,7 @@ class ManticoreBase(Eventful):
             callback = MethodType(callback, self)
         super().subscribe(name, callback)
 
-    @property
+    @property  # type: ignore
     @at_not_running
     def context(self):
         """ Convenient access to shared context. We maintain a local copy of the
@@ -795,8 +873,14 @@ class ManticoreBase(Eventful):
             Workers must terminate
             RUNNING, STANDBY -> KILLED
         """
+        self._publish("will_terminate_execution", self._output)
         self._killed.value = True
         self._lock.notify_all()
+        self._publish("did_terminate_execution", self._output)
+
+    def terminate(self):
+        logger.warning("manticore.terminate is deprecated (Use manticore.kill)")
+        self.kill()
 
     @sync
     def is_running(self):
@@ -843,10 +927,9 @@ class ManticoreBase(Eventful):
             timer.cancel()
 
     @at_not_running
-    def run(self, timeout=None):
+    def run(self):
         """
         Runs analysis.
-        :param timeout: Analysis timeout, in seconds
         """
         # Delete state cache
         # The cached version of a state may get out of sync if a worker in a
@@ -979,6 +1062,10 @@ class ManticoreThreading(ManticoreBase):
         super().__init__(*args, **kwargs)
 
 
+def raise_signal():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 class ManticoreMultiprocessing(ManticoreBase):
     _worker_type = WorkerProcess
 
@@ -986,7 +1073,7 @@ class ManticoreMultiprocessing(ManticoreBase):
         # This is the global manager that will handle all shared memory access
         # See. https://docs.python.org/3/library/multiprocessing.html#multiprocessing.managers.SyncManager
         self._manager = SyncManager()
-        self._manager.start(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+        self._manager.start(raise_signal)
         # The main manticore lock. Acquire this for accessing shared objects
         # THINKME: we use the same lock to access states lists and shared contexts
         self._lock = self._manager.Condition()

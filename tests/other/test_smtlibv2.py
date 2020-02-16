@@ -14,6 +14,7 @@ from manticore.core.smtlib import (
 )
 from manticore.core.smtlib.solver import Z3Solver
 from manticore.core.smtlib.expression import *
+from manticore.utils.helpers import pickle_dumps
 
 # logging.basicConfig(filename = "test.log",
 #                format = "%(asctime)s: %(name)s:%(levelname)s: %(message)s",
@@ -81,6 +82,18 @@ class ExpressionTest(unittest.TestCase):
         self.assertTrue("SOURCE3" in x.taint)
         self.assertTrue("SOURCE4" in x.taint)
 
+    def test_cs_new_bitvec_invalid_size(self):
+        cs = ConstraintSet()
+        with self.assertRaises(ValueError) as e:
+            cs.new_bitvec(size=0)
+
+        self.assertEqual(str(e.exception), "Bitvec size (0) can't be equal to or less than 0")
+
+        with self.assertRaises(ValueError) as e:
+            cs.new_bitvec(size=-23)
+
+        self.assertEqual(str(e.exception), "Bitvec size (-23) can't be equal to or less than 0")
+
     def testBasicConstraints(self):
         cs = ConstraintSet()
         a = cs.new_bitvec(32)
@@ -94,12 +107,34 @@ class ExpressionTest(unittest.TestCase):
         cs.add(a + b > 100)
         self.assertTrue(self.solver.check(cs))
 
-    def testBool(self):
+    def testBool1(self):
         cs = ConstraintSet()
         bf = BoolConstant(False)
         bt = BoolConstant(True)
         cs.add(Operators.AND(bf, bt))
         self.assertFalse(self.solver.check(cs))
+
+    def testBool2(self):
+        cs = ConstraintSet()
+        bf = BoolConstant(False)
+        bt = BoolConstant(True)
+        cs.add(Operators.AND(bf, bt, bt, bt))
+        self.assertFalse(self.solver.check(cs))
+
+    def testBool3(self):
+        cs = ConstraintSet()
+        bf = BoolConstant(False)
+        bt = BoolConstant(True)
+        cs.add(Operators.AND(bt, bt, bf, bt))
+        self.assertFalse(self.solver.check(cs))
+
+    def testBool4(self):
+        cs = ConstraintSet()
+        bf = BoolConstant(False)
+        bt = BoolConstant(True)
+        cs.add(Operators.OR(True, bf))
+        cs.add(Operators.OR(bt, bt, False))
+        self.assertTrue(self.solver.check(cs))
 
     def testBasicArray(self):
         cs = ConstraintSet()
@@ -354,7 +389,7 @@ class ExpressionTest(unittest.TestCase):
         array = array.store(key, ord("A"))
         # let's restrict key to be greater than 1000
         cs.add(key.ugt(1000))
-        cs = pickle.loads(pickle.dumps(cs))
+        cs = pickle.loads(pickle_dumps(cs))
         self.assertTrue(self.solver.check(cs))
 
     def testBitvector_add(self):
@@ -394,6 +429,25 @@ class ExpressionTest(unittest.TestCase):
         cs.add(a >= 100)
         self.assertTrue(self.solver.check(cs))
         self.assertEqual(self.solver.minmax(cs, a), (100, 200))
+        from manticore import config
+
+        consts = config.get_group("smt")
+        consts.optimize = False
+        cs = ConstraintSet()
+        a = cs.new_bitvec(32)
+        cs.add(a <= 200)
+        cs.add(a >= 100)
+        self.assertTrue(self.solver.check(cs))
+        self.assertEqual(self.solver.minmax(cs, a), (100, 200))
+        consts.optimize = True
+
+    def testBitvector_max_noop(self):
+        from manticore import config
+
+        consts = config.get_group("smt")
+        consts.optimize = False
+        self.testBitvector_max()
+        consts.optimize = True
 
     def testBitvector_max1(self):
         cs = ConstraintSet()
@@ -402,6 +456,14 @@ class ExpressionTest(unittest.TestCase):
         cs.add(a > 100)
         self.assertTrue(self.solver.check(cs))
         self.assertEqual(self.solver.minmax(cs, a), (101, 199))
+
+    def testBitvector_max1_noop(self):
+        from manticore import config
+
+        consts = config.get_group("smt")
+        consts.optimize = False
+        self.testBitvector_max1()
+        consts.optimize = True
 
     def testBool_nonzero(self):
         self.assertTrue(BoolConstant(True).__bool__())
@@ -521,6 +583,25 @@ class ExpressionTest(unittest.TestCase):
         )
         self.assertEqual(translate_to_smtlib(simplify(c)), "((_ extract 23 8) VARA)")
 
+    def test_arithmetic_simplify_udiv(self):
+        cs = ConstraintSet()
+        a = cs.new_bitvec(32, name="VARA")
+        b = a + Operators.UDIV(BitVecConstant(32, 0), BitVecConstant(32, 2))
+        self.assertEqual(translate_to_smtlib(b), "(bvadd VARA (bvudiv #x00000000 #x00000002))")
+        self.assertEqual(translate_to_smtlib(simplify(b)), "VARA")
+
+        c = a + Operators.UDIV(BitVecConstant(32, 2), BitVecConstant(32, 2))
+        self.assertEqual(translate_to_smtlib(c), "(bvadd VARA (bvudiv #x00000002 #x00000002))")
+        self.assertEqual(translate_to_smtlib(simplify(c)), "(bvadd VARA #x00000001)")
+
+    def test_constant_folding_udiv(self):
+        cs = ConstraintSet()
+        x = BitVecConstant(32, 0xFFFFFFFF, taint=("important",))
+        y = BitVecConstant(32, 2, taint=("stuff",))
+        z = constant_folder(x.udiv(y))
+        self.assertItemsEqual(z.taint, ("important", "stuff"))
+        self.assertEqual(z.value, 0x7FFFFFFF)
+
     def testBasicReplace(self):
         """ Add """
         a = BitVecConstant(32, 100)
@@ -553,138 +634,6 @@ class ExpressionTest(unittest.TestCase):
         cs1.add(migrated_expression)
 
         self.assertItemsEqual(solver.get_all_values(cs1, var1), [2])  # should only be [2]
-
-    def test_ORD(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        cs.add(Operators.ORD(a) == Operators.ORD("Z"))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), ord("Z"))
-
-    def test_CHR(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        cs.add(Operators.CHR(a) == Operators.CHR(0x41))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), 0x41)
-
-    def test_CONCAT(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(16)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-
-        cs.add(b == 0x41)
-        cs.add(c == 0x42)
-        cs.add(a == Operators.CONCAT(a.size, b, c))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), Operators.CONCAT(a.size, 0x41, 0x42))
-
-    def test_ITEBV_1(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-
-        cs.add(b == 0x41)
-        cs.add(c == 0x42)
-        cs.add(a == Operators.ITEBV(8, b == c, b, c))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), 0x42)
-
-    def test_ITEBV_2(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-
-        cs.add(b == 0x44)
-        cs.add(c == 0x44)
-        cs.add(a == Operators.ITEBV(8, b == c, b, c))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), 0x44)
-
-    def test_ITE(self):
-        cs = ConstraintSet()
-        a = cs.new_bool()
-        b = cs.new_bool()
-        c = cs.new_bool()
-
-        cs.add(b == True)
-        cs.add(c == False)
-        cs.add(a == Operators.ITE(b == c, b, c))
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), False)
-
-    def test_UREM(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-        d = cs.new_bitvec(8)
-
-        cs.add(b == 0x86)  # 134
-        cs.add(c == 0x11)  # 17
-        cs.add(a == Operators.UREM(b, c))
-        cs.add(d == b.urem(c))
-        cs.add(a == d)
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), 0xF)
-
-    def test_SREM(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-        d = cs.new_bitvec(8)
-
-        cs.add(b == 0x86)  # -122
-        cs.add(c == 0x11)  # 17
-        cs.add(a == Operators.SREM(b, c))
-        cs.add(d == b.srem(c))
-        cs.add(a == d)
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), -3 & 0xFF)
-
-    def test_UDIV(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-        d = cs.new_bitvec(8)
-
-        cs.add(b == 0x86)  # 134
-        cs.add(c == 0x11)  # 17
-        cs.add(a == Operators.UDIV(b, c))
-        cs.add(d == b.udiv(c))
-        cs.add(a == d)
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), 7)
-
-    def test_SDIV(self):
-        cs = ConstraintSet()
-        a = cs.new_bitvec(8)
-        b = cs.new_bitvec(8)
-        c = cs.new_bitvec(8)
-        d = cs.new_bitvec(8)
-
-        cs.add(b == 0x86)  # -122
-        cs.add(c == 0x11)  # 17
-        cs.add(a == Operators.SDIV(b, c))
-        cs.add(d == b // c)
-        cs.add(a == d)
-
-        self.assertTrue(solver.check(cs))
-        self.assertEqual(solver.get_value(cs, a), -7 & 0xFF)
 
     def test_SAR(self):
         solver = Z3Solver.instance()
@@ -728,14 +677,14 @@ class ExpressionTest(unittest.TestCase):
             self.assertItemsEqual(solver.get_all_values(cs_up, x), range(0x0, 0x100))
             self.assertItemsEqual(solver.get_all_values(cs_up, y), range(0x80, 0x100))
 
-            saved_up = pickle.dumps((x, y, cs_up))
+            saved_up = pickle_dumps((x, y, cs_up))
 
             self.assertItemsEqual(solver.get_all_values(cs_up, x), range(0x0, 0x100))
             self.assertItemsEqual(solver.get_all_values(cs_up, y), range(0x80, 0x100))
 
             with cs_up as cs_up_right:
                 cs_up_right.add(x.uge(0x80))
-                saved_up_right = pickle.dumps((x, y, cs_up_right))
+                saved_up_right = pickle_dumps((x, y, cs_up_right))
                 self.assertItemsEqual(solver.get_all_values(cs_up_right, x), range(0x80, 0x100))
                 self.assertItemsEqual(solver.get_all_values(cs_up_right, y), range(0x80, 0x100))
 
@@ -744,7 +693,7 @@ class ExpressionTest(unittest.TestCase):
 
             with cs_up as cs_up_left:
                 cs_up_left.add(x.ult(0x80))
-                saved_up_left = pickle.dumps((x, y, cs_up_left))
+                saved_up_left = pickle_dumps((x, y, cs_up_left))
                 self.assertItemsEqual(solver.get_all_values(cs_up_left, x), range(0, 0x80))
                 self.assertItemsEqual(solver.get_all_values(cs_up_left, y), range(0x80, 0x100))
 
@@ -757,14 +706,14 @@ class ExpressionTest(unittest.TestCase):
             self.assertItemsEqual(solver.get_all_values(cs_down, x), range(0x0, 0x100))
             self.assertItemsEqual(solver.get_all_values(cs_down, y), range(0, 0x80))
 
-            saved_down = pickle.dumps((x, y, cs_down))
+            saved_down = pickle_dumps((x, y, cs_down))
 
             self.assertItemsEqual(solver.get_all_values(cs_down, x), range(0x0, 0x100))
             self.assertItemsEqual(solver.get_all_values(cs_down, y), range(0, 0x80))
 
             with cs_down as cs_down_right:
                 cs_down_right.add(x.uge(0x80))
-                saved_down_right = pickle.dumps((x, y, cs_down_right))
+                saved_down_right = pickle_dumps((x, y, cs_down_right))
                 self.assertItemsEqual(solver.get_all_values(cs_down_right, x), range(0x80, 0x100))
                 self.assertItemsEqual(solver.get_all_values(cs_down_right, y), range(0, 0x80))
 
@@ -773,7 +722,7 @@ class ExpressionTest(unittest.TestCase):
 
             with cs_down as cs_down_left:
                 cs_down_left.add(x.ult(0x80))
-                saved_down_left = pickle.dumps((x, y, cs_down_left))
+                saved_down_left = pickle_dumps((x, y, cs_down_left))
                 self.assertItemsEqual(solver.get_all_values(cs_down_left, x), range(0, 0x80))
                 self.assertItemsEqual(solver.get_all_values(cs_down_left, y), range(0, 0x80))
 
@@ -812,6 +761,15 @@ class ExpressionTest(unittest.TestCase):
 
         self.assertTrue(solver.check(cs))
         self.assertEqual(solver.get_value(cs, a), ord("Z"))
+
+    def test_ORD_proper_extract(self):
+        solver = Z3Solver.instance()
+        cs = ConstraintSet()
+        a = cs.new_bitvec(32)
+        cs.add(Operators.ORD(a) == Operators.ORD("\xff"))
+
+        self.assertTrue(solver.check(cs))
+        self.assertEqual(solver.get_value(cs, a), ord("\xff"))
 
     def test_CHR(self):
         solver = Z3Solver.instance()
@@ -946,12 +904,79 @@ class ExpressionTest(unittest.TestCase):
         self.assertTrue(solver.check(cs))
         self.assertEqual(solver.get_value(cs, a), -7 & 0xFF)
 
+    def test_ULE(self):
+        solver = Z3Solver.instance()
+        cs = ConstraintSet()
+        a = cs.new_bitvec(8)
+        b = cs.new_bitvec(8)
+        c = cs.new_bitvec(8)
+
+        cs.add(a == 0x1)  # 1
+        cs.add(b == 0x86)  # -122
+        cs.add(c == 0x11)  # 17
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(a, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(a, c)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(c, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(a, 0xF2)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(b, 0x99)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(c, 0x12)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(3, 0xF2)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(3, 3)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(1, a)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(0x85, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULE(0x10, c)))
+
+    def test_ULT(self):
+        solver = Z3Solver.instance()
+        cs = ConstraintSet()
+        a = cs.new_bitvec(8)
+        b = cs.new_bitvec(8)
+        c = cs.new_bitvec(8)
+
+        cs.add(a == 0x1)  # 1
+        cs.add(b == 0x86)  # -122
+        cs.add(c == 0x11)  # 17
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(a, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(a, c)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(c, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(a, 0xF2)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(b, 0x99)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(c, 0x12)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(3, 0xF2)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(3, 4)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(0, a)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(0x85, b)))
+        self.assertTrue(solver.must_be_true(cs, Operators.ULT(0x10, c)))
+
+    def test_NOT(self):
+        solver = Z3Solver.instance()
+        cs = ConstraintSet()
+        a = cs.new_bitvec(8)
+        b = cs.new_bitvec(8)
+
+        cs.add(a == 0x1)  # 1
+        cs.add(b == 0x86)  # -122
+        self.assertTrue(solver.must_be_true(cs, Operators.NOT(False)))
+        self.assertTrue(solver.must_be_true(cs, Operators.NOT(a == b)))
+
     def test_check_solver_min(self):
         self.solver._received_version = '(:version "4.4.1")'
         self.assertTrue(self.solver._solver_version() == Version(major=4, minor=4, patch=1))
 
     def test_check_solver_newer(self):
         self.solver._received_version = '(:version "4.5.0")'
+        self.assertTrue(self.solver._solver_version() > Version(major=4, minor=4, patch=1))
+
+    def test_check_solver_long_format(self):
+        self.solver._received_version = '(:version "4.8.6 - build hashcode 78ed71b8de7d")'
+        self.assertTrue(self.solver._solver_version() == Version(major=4, minor=8, patch=6))
+
+    def test_check_solver_undefined(self):
+        self.solver._received_version = '(:version "78ed71b8de7d")'
+        self.assertTrue(
+            self.solver._solver_version()
+            == Version(major=float("inf"), minor=float("inf"), patch=float("inf"))
+        )
         self.assertTrue(self.solver._solver_version() > Version(major=4, minor=4, patch=1))
 
 

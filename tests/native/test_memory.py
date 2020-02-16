@@ -12,14 +12,14 @@ from io import BytesIO
 
 from manticore.core.smtlib import Expression
 from manticore.core.smtlib.solver import Z3Solver
+from manticore.core.state import Concretize
 from manticore.native.memory import *
+from manticore.utils import config
+from manticore.utils.helpers import pickle_dumps
 from manticore import issymbolic
 
 solver = Z3Solver.instance()
-
-
-def isconcrete(value):
-    return not issymbolic(value)
+consts = config.get_group("native")
 
 
 class MemoryTest(unittest.TestCase):
@@ -214,9 +214,19 @@ class MemoryTest(unittest.TestCase):
         # alloc/map a byte
         first = mem.mmap(0x1000, 0x1000, "r")
 
+        consts.fast_crash = True
         self.assertEqual(first, 0x1000)
         self.assertEqual(mem[0x1000], b"\x00")
         self.assertRaises(MemoryException, mem.__getitem__, sym)
+        self.assertRaises(MemoryException, mem.__setitem__, 0x1000, "\x41")
+        self.assertRaises(MemoryException, mem.__setitem__, 0x1000, val)
+        self.assertRaises(MemoryException, mem.__setitem__, sym, "\x41")
+        self.assertRaises(MemoryException, mem.__setitem__, sym, val)
+
+        consts.fast_crash = False
+        self.assertEqual(first, 0x1000)
+        self.assertEqual(mem[0x1000], b"\x00")
+        self.assertRaises(Concretize, mem.__getitem__, sym)
         self.assertRaises(MemoryException, mem.__setitem__, 0x1000, "\x41")
         self.assertRaises(MemoryException, mem.__setitem__, 0x1000, val)
         self.assertRaises(MemoryException, mem.__setitem__, sym, "\x41")
@@ -242,6 +252,7 @@ class MemoryTest(unittest.TestCase):
         # alloc/map a byte
         first = mem.mmap(0x1000, 0x1000, "w")
 
+        consts.fast_crash = True
         self.assertEqual(first, 0x1000)
         self.assertRaises(MemoryException, mem.__getitem__, 0x1000)
         self.assertRaises(MemoryException, mem.__getitem__, sym)
@@ -250,10 +261,40 @@ class MemoryTest(unittest.TestCase):
         self.assertRaises(MemoryException, mem.__setitem__, sym, "\x41")
         self.assertRaises(MemoryException, mem.__setitem__, sym, val)
 
+        consts.fast_crash = False
+        self.assertRaises(MemoryException, mem.__getitem__, 0x1000)
+        self.assertRaises(MemoryException, mem.__getitem__, sym)
+        mem[0x1000] = "\x40"
+        mem[0x1000] = val
+        self.assertRaises(Concretize, mem.__setitem__, sym, "\x41")
+        self.assertRaises(Concretize, mem.__setitem__, sym, val)
+
         cs.add(sym.uge(0x1000))
 
         mem[sym] = "\x40"
         mem[sym] = val
+
+    def test_max_exec_size(self):
+        mem = Memory32()
+        # start with no maps
+        self.assertEqual(len(mem.mappings()), 0)
+
+        # alloc/map a byte
+        notExecMap = mem.mmap(0x1000, 0x1000, "rw")
+        isExecMap = mem.mmap(0x2000, 0x1000, "x")
+        anotherExecMap = mem.mmap(0x3000, 0x1000, "rwx")
+        # Okay 2 maps
+        self.assertEqual(len(mem.mappings()), 3)
+
+        # 0 size when not executable at all
+        self.assertEqual(mem.max_exec_size(notExecMap - 1, 16), 0)
+        self.assertEqual(mem.max_exec_size(notExecMap, 16), 0)
+        # maximum size when executable
+        self.assertEqual(mem.max_exec_size(isExecMap, 16), 16)
+        # maximum size when executable across maps
+        self.assertEqual(mem.max_exec_size(isExecMap + 0x1000 - 12, 16), 16)
+        # restricted size when executable until boundary
+        self.assertEqual(mem.max_exec_size(anotherExecMap + 0x1000 - 12, 16), 12)
 
     def test_access(self):
         mem = Memory32()
@@ -1105,46 +1146,88 @@ class MemoryTest(unittest.TestCase):
         cs = ConstraintSet()
         mem = SMemory32(cs)
 
-        start_mapping_addr = mem.mmap(None, 0x1000, "rwx")
+        buf = mem.mmap(None, 0x20, "rwx")
 
-        concretes = [0, 2, 4, 6]
-        symbolics = [1, 3, 5, 7]
+        concretes = tuple(buf + idx for idx in (0, 2, 4, 6))
+        symbolics = tuple(buf + idx for idx in (1, 3, 5, 7))
+        symbolic_vectors = tuple(cs.new_bitvec(8) for _ in symbolics)
 
-        for range in concretes:
-            mem[start_mapping_addr + range] = "C"
+        # Initialize
+        for addr in concretes:
+            mem[addr] = "C"
 
-        for range in symbolics:
-            mem[start_mapping_addr + range] = cs.new_bitvec(8)
+        for addr, symbolic_vector in zip(symbolics, symbolic_vectors):
+            mem[addr] = symbolic_vector
 
-        for range in concretes:
-            self.assertTrue(isconcrete(mem[start_mapping_addr + range]))
+        # Check if they are concretes/symbolics
+        for addr in concretes:
+            self.assertFalse(issymbolic(mem[addr]))
 
-        for range in concretes:
-            self.assertFalse(issymbolic(mem[start_mapping_addr + range]))
+        for addr in symbolics:
+            self.assertTrue(issymbolic(mem[addr]))
 
-        for range in symbolics:
-            self.assertTrue(issymbolic(mem[start_mapping_addr + range]))
+        # And assert the internal symbolic chunks dict representation
+        self.assertDictEqual(
+            mem._symbols,
+            {
+                addr: [(True, symbolic_vector)]
+                for addr, symbolic_vector in zip(symbolics, symbolic_vectors)
+            },
+        )
 
-        for range in symbolics:
-            self.assertFalse(isconcrete(mem[start_mapping_addr + range]))
+        # Swap concrete and symbolic bytes; create new symbolic_vectors
+        concretes, symbolics = symbolics, concretes
+        symbolic_vectors = tuple(cs.new_bitvec(8) for _ in symbolics)
 
-        for range in symbolics:
-            mem[start_mapping_addr + range] = "C"
+        # Reinitialize
+        for addr in concretes:
+            mem[addr] = "C"
 
-        for range in concretes:
-            mem[start_mapping_addr + range] = cs.new_bitvec(8)
+        for addr, symbolic_vector in zip(symbolics, symbolic_vectors):
+            mem[addr] = symbolic_vector
 
-        for range in symbolics:
-            self.assertTrue(isconcrete(mem[start_mapping_addr + range]))
+        # Assert again
+        for addr in concretes:
+            self.assertFalse(issymbolic(mem[addr]))
 
-        for range in symbolics:
-            self.assertFalse(issymbolic(mem[start_mapping_addr + range]))
+        for addr in symbolics:
+            self.assertTrue(issymbolic(mem[addr]))
 
-        for range in concretes:
-            self.assertTrue(issymbolic(mem[start_mapping_addr + range]))
+        # And reassert the internal symbolic chunks dict representation
+        expected_symbolic_chunks = {
+            addr: [(True, symbolic_vector)]
+            for addr, symbolic_vector in zip(symbolics, symbolic_vectors)
+        }
+        self.assertDictEqual(mem._symbols, expected_symbolic_chunks)
 
-        for range in concretes:
-            self.assertFalse(isconcrete(mem[start_mapping_addr + range]))
+        # Do a write to memory that combines concrete and symbolic value and see if it succeeds
+        symbolic_bytes = [cs.new_bitvec(8) for _ in range(4)]
+        mem[buf + 0x10 : buf + 0x17] = (
+            symbolic_bytes[0],
+            "A",  # will be converted to b'A'
+            symbolic_bytes[1],
+            symbolic_bytes[2],
+            b"B",
+            b"C",
+            symbolic_bytes[3],
+        )
+
+        # And assert it!
+        for idx, symbolic_val in zip((0x10, 0x12, 0x13, 0x16), symbolic_bytes):
+            addr = buf + idx
+            self.assertIs(
+                mem[addr], symbolic_val
+            )  # We can't do assertEqual as `==` operator leads to an expression
+            self.assertTrue(issymbolic(mem[addr]))
+            expected_symbolic_chunks[addr] = [(True, symbolic_val)]
+
+        for idx, val in ((0x11, b"A"), (0x14, b"B"), (0x15, b"C")):
+            byte = mem[buf + idx]
+            self.assertEqual(byte, val)
+            self.assertFalse(issymbolic(byte))
+
+        self.assertDictEqual(mem._symbols, expected_symbolic_chunks)
+        self.assertEqual(len(mem._symbols), 8)  # Sanity check if keys didn't overlap
 
     def test_one_concrete_one_symbolic(self):
         # global mainsolver
@@ -1238,7 +1321,7 @@ class MemoryTest(unittest.TestCase):
 
         self.assertItemsEqual(mem[x : x + 4], b"defg")
         self.assertItemsEqual(mem[addr : addr + 4], b"defg")
-        mem, x = pickle.loads(pickle.dumps((mem, x)))
+        mem, x = pickle.loads(pickle_dumps((mem, x)))
         self.assertItemsEqual(mem[x : x + 4], b"defg")
         self.assertItemsEqual(mem[addr : addr + 4], b"defg")
 
@@ -1290,7 +1373,7 @@ class MemoryTest(unittest.TestCase):
 
         mem.mprotect(addr, size, "w")
         with self.assertRaisesRegex(
-            InvalidMemoryAccess, f"Invalid memory access \(mode:.\) <{addr:x}>"
+            InvalidMemoryAccess, fr"Invalid memory access \(mode:.\) <{addr:x}>"
         ):
             _ = mem[addr]
 
@@ -1345,7 +1428,7 @@ class MemoryTest(unittest.TestCase):
         # No Access Reading <4160741376>
         # self.assertRaisesRegexp(MemoryException, r"No access reading.*", mem.__getitem__, x)
         with self.assertRaisesRegex(
-            InvalidSymbolicMemoryAccess, "Invalid symbolic memory access.*".format(addr)
+            InvalidSymbolicMemoryAccess, r"Invalid symbolic memory access \(mode:r\)"
         ):
             _ = mem[x]
             # mem[addr] = 'a'
@@ -1362,7 +1445,7 @@ class MemoryTest(unittest.TestCase):
         mem[addr] = "a"
         mem.mprotect(addr, size, "r")
         with self.assertRaisesRegex(
-            InvalidMemoryAccess, f"Invalid memory access \(mode:w\) <{addr:x}>"
+            InvalidMemoryAccess, fr"Invalid memory access \(mode:w\) <{addr:x}>"
         ):
             mem[addr] = "a"
 
@@ -1378,7 +1461,7 @@ class MemoryTest(unittest.TestCase):
         mem[addr] = "a"
 
         with self.assertRaisesRegex(
-            InvalidMemoryAccess, f"Invalid memory access \(mode:r\) <{addr:x}>"
+            InvalidMemoryAccess, fr"Invalid memory access \(mode:r\) <{addr:x}>"
         ):
             _ = mem[addr]
 
@@ -1431,7 +1514,7 @@ class MemoryTest(unittest.TestCase):
     def test_pickle_mmap_anon(self):
         m = AnonMap(0x10000000, 0x3000, "rwx")
         m[0x10001000] = "A"
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"A")
 
@@ -1442,7 +1525,7 @@ class MemoryTest(unittest.TestCase):
         rwx_file.close()
         m = FileMap(0x10000000, 0x3000, "rwx", rwx_file.name)
         m[0x10000000] = "Y"
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"X")
         self.assertEqual(m[0x10000000], b"Y")
@@ -1450,7 +1533,7 @@ class MemoryTest(unittest.TestCase):
     def test_pickle_mmap_anon_cow(self):
         m = AnonMap(0x10000000, 0x3000, "rwx", "X" * 0x1000 + "Y" * 0x1000 + "Z" * 0x1000)
         m = COWMap(m)
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"Y")
         self.assertEqual(m.start, 0x10000000)
@@ -1459,7 +1542,7 @@ class MemoryTest(unittest.TestCase):
     def test_pickle_mmap_anon_cow_offset(self):
         m = AnonMap(0x10000000, 0x3000, "rwx", "X" * 0x1000 + "Y" * 0x1000 + "Z" * 0x1000)
         m = COWMap(m, offset=0x1000, size=0x1000)
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"Y")
         self.assertEqual(m.start, 0x10001000)
@@ -1472,7 +1555,7 @@ class MemoryTest(unittest.TestCase):
         rwx_file.close()
         m = FileMap(0x10000000, 0x3000, "rwx", rwx_file.name)
         m = COWMap(m)
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"Y")
         self.assertEqual(m.start, 0x10000000)
@@ -1485,7 +1568,7 @@ class MemoryTest(unittest.TestCase):
         rwx_file.close()
         m = FileMap(0x10000000, 0x3000, "rwx", rwx_file.name)
         m = COWMap(m, size=0x1000, offset=0x1000)
-        s = BytesIO(pickle.dumps(m))
+        s = BytesIO(pickle_dumps(m))
         m = pickle.load(s)
         self.assertEqual(m[0x10001000], b"Y")
         self.assertEqual(m.start, 0x10001000)
@@ -1517,7 +1600,7 @@ class MemoryTest(unittest.TestCase):
 
         # save it
 
-        s = BytesIO(pickle.dumps(mem))
+        s = BytesIO(pickle_dumps(mem))
 
         # load it
         mem1 = pickle.load(s)
@@ -1611,7 +1694,7 @@ class MemoryTest(unittest.TestCase):
         self.assertEqual(len(head), 0x3000 - 1)
         self.assertEqual(len(tail), 1)
 
-        m = pickle.loads(pickle.dumps(m))
+        m = pickle.loads(pickle_dumps(m))
         self.assertItemsEqual(m[0x10000000:0x10000003], b"YZ\x00")
 
     def test_mmap_file_extra(self):
@@ -1625,7 +1708,7 @@ class MemoryTest(unittest.TestCase):
         m[0x100027F0:0x10002810] = "Y" * 0x20
         self.assertItemsEqual(m[0x10000000:0x10003000], b"X" * 0x27F0 + b"Y" * 0x20 + bytes(0x7F0))
 
-        m = pickle.loads(pickle.dumps(m))
+        m = pickle.loads(pickle_dumps(m))
         self.assertItemsEqual(
             m[0x10000000:0x10003000], b"X" * 0x27F0 + b"Y" * 0x20 + b"\x00" * 0x7F0
         )
@@ -1641,8 +1724,8 @@ class MemoryTest(unittest.TestCase):
         mem.write(addr + 1, "b")
         writes = mem.pop_record_writes()
 
-        self.assertIn((addr, ["a"]), writes)
-        self.assertIn((addr + 1, ["b"]), writes)
+        self.assertIn((addr, "a"), writes)
+        self.assertIn((addr + 1, "b"), writes)
 
     def test_mem_trace_no_overwrites(self):
         cs = ConstraintSet()
@@ -1655,8 +1738,8 @@ class MemoryTest(unittest.TestCase):
         mem.write(addr, "b")
         writes = mem.pop_record_writes()
 
-        self.assertIn((addr, ["a"]), writes)
-        self.assertIn((addr, ["b"]), writes)
+        self.assertIn((addr, "a"), writes)
+        self.assertIn((addr, "b"), writes)
 
     def test_mem_trace_nested(self):
         cs = ConstraintSet()
@@ -1674,17 +1757,17 @@ class MemoryTest(unittest.TestCase):
         outer_writes = mem.pop_record_writes()
 
         # Make sure writes do not appear in a trace started after them
-        self.assertNotIn((addr, ["a"]), inner_writes)
-        self.assertNotIn((addr + 1, ["b"]), inner_writes)
+        self.assertNotIn((addr, "a"), inner_writes)
+        self.assertNotIn((addr + 1, "b"), inner_writes)
         # Make sure the first two are in the outer write
-        self.assertIn((addr, ["a"]), outer_writes)
-        self.assertIn((addr + 1, ["b"]), outer_writes)
+        self.assertIn((addr, "a"), outer_writes)
+        self.assertIn((addr + 1, "b"), outer_writes)
         # Make sure the last two are in the inner write
-        self.assertIn((addr + 2, ["c"]), inner_writes)
-        self.assertIn((addr + 3, ["d"]), inner_writes)
+        self.assertIn((addr + 2, "c"), inner_writes)
+        self.assertIn((addr + 3, "d"), inner_writes)
         # Make sure the last two are also in the outer write
-        self.assertIn((addr + 2, ["c"]), outer_writes)
-        self.assertIn((addr + 3, ["d"]), outer_writes)
+        self.assertIn((addr + 2, "c"), outer_writes)
+        self.assertIn((addr + 3, "d"), outer_writes)
 
     def test_mem_trace_ignores_failing(self):
         cs = ConstraintSet()
@@ -1741,7 +1824,13 @@ class MemoryTest(unittest.TestCase):
         cs.add(addr1 <= (ro + 16))
 
         # Can write to unmapped memory, should raise despite force
+        consts.fast_crash = True
         with self.assertRaises(InvalidSymbolicMemoryAccess):
+            mem.write(addr1, msg, force=True)
+
+        # Under normal conditions, this concretizes on memory safety
+        consts.fast_crash = False
+        with self.assertRaises(Concretize):
             mem.write(addr1, msg, force=True)
 
         # 2. Force write to mapped memory, should not raise; no force should
@@ -1757,7 +1846,13 @@ class MemoryTest(unittest.TestCase):
         cs.add(addr3 > (nul_end - 16))
         # single byte into unmapped memory
         cs.add(addr3 <= (nul_end - len(msg) + 1))
+        consts.fast_crash = True
         with self.assertRaises(InvalidSymbolicMemoryAccess):
+            mem.write(addr3, msg, force=True)
+
+        # Normally, concretize on memory safety
+        consts.fast_crash = False
+        with self.assertRaises(Concretize):
             mem.write(addr3, msg, force=True)
 
         # 4. Try to force-read a span from mapped, but unreadable memory, should not raise

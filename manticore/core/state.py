@@ -1,8 +1,7 @@
 import copy
 import logging
 
-from .smtlib import solver, Bool
-from ..utils.helpers import issymbolic
+from .smtlib import solver, Bool, issymbolic, BitVecConstant
 from ..utils.event import Eventful
 
 logger = logging.getLogger(__name__)
@@ -39,18 +38,42 @@ class Concretize(StateException):
 
     """
 
-    _ValidPolicies = ["MINMAX", "ALL", "SAMPLED", "ONE"]
+    _ValidPolicies = ["MIN", "MAX", "MINMAX", "ALL", "SAMPLED", "ONE"]
 
     def __init__(self, message, expression, setstate=None, policy=None, **kwargs):
         if policy is None:
             policy = "ALL"
         if policy not in self._ValidPolicies:
-            raise Exception(f'Policy ({policy}) must be one of: {", ".join(self._ValidPolicies)}')
+            raise StateException(
+                f'Policy ({policy}) must be one of: {", ".join(self._ValidPolicies)}'
+            )
         self.expression = expression
         self.setstate = setstate
         self.policy = policy
         self.message = f"Concretize: {message} (Policy: {policy})"
         super().__init__(**kwargs)
+
+
+class SerializeState(Concretize):
+    """ Allows the user to save a copy of the current state somewhere on the
+        disk so that analysis can later be resumed from this point.
+    """
+
+    def setstate(self, state, _value):
+        from ..utils.helpers import PickleSerializer
+
+        with open(self.filename, "wb") as statef:
+            PickleSerializer().serialize(state, statef)
+
+    def __init__(self, filename, **kwargs):
+        super().__init__(
+            f"Saving state to {filename}",
+            BitVecConstant(32, 0),
+            setstate=self.setstate,
+            policy="ONE",
+            **kwargs,
+        )
+        self.filename = filename
 
 
 class ForkState(Concretize):
@@ -84,6 +107,7 @@ class StateBase(Eventful):
         self._input_symbols = list()
         self._child = None
         self._context = dict()
+        self._terminated_by = None
         # 33
         # Events are lost in serialization and fork !!
         self.forward_events_from(platform)
@@ -95,6 +119,7 @@ class StateBase(Eventful):
         state["input_symbols"] = self._input_symbols
         state["child"] = self._child
         state["context"] = self._context
+        state["terminated_by"] = self._terminated_by
         return state
 
     def __setstate__(self, state):
@@ -104,6 +129,7 @@ class StateBase(Eventful):
         self._input_symbols = state["input_symbols"]
         self._child = state["child"]
         self._context = state["context"]
+        self._terminated_by = state["terminated_by"]
         # 33
         # Events are lost in serialization and fork !!
         self.forward_events_from(self._platform)
@@ -245,9 +271,9 @@ class StateBase(Eventful):
         if policy == "MINMAX":
             vals = self._solver.minmax(self._constraints, symbolic)
         elif policy == "MAX":
-            vals = self._solver.max(self._constraints, symbolic)
+            vals = (self._solver.max(self._constraints, symbolic),)
         elif policy == "MIN":
-            vals = self._solver.min(self._constraints, symbolic)
+            vals = (self._solver.min(self._constraints, symbolic),)
         elif policy == "SAMPLED":
             m, M = self._solver.minmax(self._constraints, symbolic)
             vals += [m, M]
@@ -309,22 +335,34 @@ class StateBase(Eventful):
 
     def solve_one(self, expr, constrain=False):
         """
+        A version of solver_one_n for a single expression. See solve_one_n.
+        """
+        return self.solve_one_n(expr, constrain=constrain)[0]
+
+    def solve_one_n(self, *exprs, constrain=False):
+        """
         Concretize a symbolic :class:`~manticore.core.smtlib.expression.Expression` into
         one solution.
 
-        :param manticore.core.smtlib.Expression expr: Symbolic value to concretize
-        :param bool constrain: If True, constrain expr to concretized value
-        :return: Concrete value
+        :param exprs: An iterable of manticore.core.smtlib.Expression
+        :param bool constrain: If True, constrain expr to solved solution value
+        :return: Concrete value or a tuple of concrete values
         :rtype: int
         """
-        expr = self.migrate_expression(expr)
-        value = self._solver.get_value(self._constraints, expr)
-        if constrain:
-            self.constrain(expr == value)
-        # Include forgiveness here
-        if isinstance(value, bytearray):
-            value = bytes(value)
-        return value
+        values = []
+        for expr in exprs:
+            if not issymbolic(expr):
+                values.append(expr)
+            else:
+                expr = self.migrate_expression(expr)
+                value = self._solver.get_value(self._constraints, expr)
+                if constrain:
+                    self.constrain(expr == value)
+                # Include forgiveness here
+                if isinstance(value, bytearray):
+                    value = bytes(value)
+                values.append(value)
+        return values
 
     def solve_n(self, expr, nsolves):
         """

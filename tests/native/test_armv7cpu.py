@@ -11,6 +11,7 @@ from manticore.core.smtlib import *
 from manticore.core.state import Concretize
 from manticore.core.smtlib.solver import Z3Solver
 from manticore.native.memory import SMemory32
+from manticore.utils.helpers import pickle_dumps
 
 ks = Ks(KS_ARCH_ARM, KS_MODE_ARM)
 ks_thumb = Ks(KS_ARCH_ARM, KS_MODE_THUMB)
@@ -1666,6 +1667,11 @@ class Armv7CpuInstructions(unittest.TestCase):
     def test_lsrw_thumb(self):
         self.assertEqual(self.cpu.R5, 16 >> 3)
 
+    @itest_setregs("R0=11", "R2=2")
+    @itest_thumb("lsr.w R0, R0, R2")
+    def test_lsrw_thumb_reg(self):
+        self.assertEqual(self.cpu.R0, 11 >> 2)
+
     @itest_setregs("R5=0", "R6=16")
     @itest_thumb("asr.w R5, R6, #3")
     def test_asrw_thumb(self):
@@ -1922,7 +1928,7 @@ class Armv7CpuInstructions(unittest.TestCase):
     def test_arm_save_restore_cpu(self):
         import pickle
 
-        dumped_s = pickle.dumps(self.cpu)
+        dumped_s = pickle_dumps(self.cpu)
         self.cpu = pickle.loads(dumped_s)
 
     def test_symbolic_conditional(self):
